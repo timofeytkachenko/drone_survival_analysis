@@ -225,7 +225,7 @@ For each drone **in service** (a test drone still flying at the data cut-off) wi
 | **Median remaining life** | The drone works longer than this with 50% probability | Typical expected life |
 | **Expected remaining life** | Mean remaining life within the horizon (1111 h) | Fleet capacity planning |
 
-**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\,dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; Cox predicts 17.4%, 14.4%, 16.1% and 15.9%. So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
+**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\thinspace dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; Cox predicts 17.4%, 14.4%, 16.1% and 15.9%. So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
 
 **Maintenance priority:**
 
