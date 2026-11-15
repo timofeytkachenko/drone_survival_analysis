@@ -193,16 +193,24 @@ Properties and caveats:
 ### 5.2 Accelerated failure time (`survival:aft`)
 
 $$
-\log T^{\ast} = f(x) + \sigma \varepsilon, \qquad \varepsilon \sim \mathcal{N}(0, 1),
+\log T^{\ast} = f(x) + \sigma \varepsilon,
 $$
 
-i.e. a log-normal lifetime whose location the trees predict (`aft_loss_distribution="normal"`, $\sigma$ = `aft_loss_distribution_scale`, tuned). Labels are intervals: $[T, T]$ for failures, $[T, +\infty)$ for censored rows. Then
+where the trees predict the location $f(x)$ and $\varepsilon$ is noise with a fixed distribution: `aft_loss_distribution` selects it, $\sigma$ = `aft_loss_distribution_scale`, and both are tuned (section 6). Labels are intervals: $[T, T]$ for failures, $[T, +\infty)$ for censored rows. Then
 
 $$
-S(t \mid x) = 1 - \Phi\left(\frac{\log t - f(x)}{\sigma}\right), \qquad h(t \mid x) = \frac{\varphi(z)}{\sigma t\thinspace (1 - \Phi(z))}, \quad z = \frac{\log t - f(x)}{\sigma}.
+S(t \mid x) = e^{-H(z)}, \qquad h(t \mid x) = \frac{H'(z)}{\sigma t}, \qquad z = \frac{\log t - f(x)}{\sigma},
 $$
 
-The hazard is computed as `exp(logpdf − logsf)` to stay finite deep in the right tail. The log-normal hazard rises, peaks and then falls; this shape is imposed whatever the data say.
+where the cumulative hazard $H$ of the noise depends on the distribution (`utils._aft_noise`):
+
+| `aft_loss_distribution` | Lifetime | $H(z)$ | $H'(z)$ | Hazard shape |
+|---|---|---|---|---|
+| `normal` | log-normal | $-\log(1 - \Phi(z))$ | $\varphi(z) / (1 - \Phi(z))$ | rises, peaks, then falls |
+| `logistic` | log-logistic | $\log(1 + e^{z})$ | $e^{z} / (1 + e^{z})$ | one peak for $\sigma < 1$, otherwise falls |
+| `extreme` | Weibull | $e^{z}$ | $e^{z}$ | monotone: rises for $\sigma < 1$, falls for $\sigma > 1$ |
+
+For `normal`, $H'$ is computed as `exp(logpdf − logsf)` to stay finite deep in the right tail. Whichever distribution is chosen, the shape of the hazard is imposed by it and not learned from the data. Parameters without `aft_loss_distribution` (models saved before it was tuned) mean `normal`.
 
 ### 5.3 Common interface
 
@@ -218,7 +226,7 @@ The hazard is computed as `exp(logpdf − logsf)` to stay finite deep in the rig
 
 - `max_depth` 2–5; `eta` 0.025–0.15 (log); `min_child_weight` 1–30 (log);
 - `subsample`, `colsample_bytree` 0.7–1.0; `reg_lambda` 0.1–20 (log);
-- AFT only: `aft_loss_distribution_scale` 0.2–2.0 (log).
+- AFT only: `aft_loss_distribution` in `normal`, `logistic`, `extreme`; `aft_loss_distribution_scale` 0.2–2.0 (log).
 
 **Objective: validation Integrated Brier score** on `evaluation_times(valid)`, with the censoring distribution of the validation set. IBS measures probability accuracy, not just ranking, which matters because the forecasts are used as probabilities (spare-parts planning, maintenance thresholds). The best parameters are refitted with early stopping on validation.
 
@@ -276,7 +284,7 @@ A landmark Poisson recalibration of the 100-hour failure probability alone was a
 
 `Model.hazard(data, times, bandwidth)`:
 
-- **AFT**: the exact log-normal hazard (section 5.2).
+- **AFT**: the exact hazard of its distribution (section 5.2).
 - **Cox**: the Breslow baseline is a step function with no density, so its jumps are smoothed with the same Epanechnikov kernel as the observed hazard, $\hat h_0(t) = \sum_j K_b(t - t_j)\thinspace \Delta \hat H_0(t_j)$, and multiplied by $\exp(f(x))$. Same edge bias near 0 and near the last training event.
 - With calibration, both are multiplied by $g'(H(t \mid x))$.
 

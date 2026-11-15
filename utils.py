@@ -9,6 +9,7 @@ import pandas as pd
 import shap
 import xgboost as xgb
 from scipy.optimize import minimize
+from scipy.special import expit
 from scipy.stats import norm
 from sksurv.metrics import (
     brier_score,
@@ -348,13 +349,33 @@ def _fit_frailty_link(cum_hazard: np.ndarray, event: np.ndarray) -> dict[str, fl
     }
 
 
+AFT_DISTRIBUTIONS = ("normal", "logistic", "extreme")
+
+
+def _aft_noise(distribution: str, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Cumulative hazard ``-log S(z)`` of the AFT noise and its derivative in ``z``.
+
+    ``z = (log t - f(x)) / sigma``. The noise distributions of ``survival:aft``
+    give a log-normal (``"normal"``), log-logistic (``"logistic"``) or Weibull
+    (``"extreme"``) time to failure.
+    """
+    if distribution == "normal":
+        log_sf = norm.logsf(z)
+        # pdf / sf in log space stays finite deep in the right tail.
+        return -log_sf, np.exp(norm.logpdf(z) - log_sf)
+    if distribution == "logistic":
+        return np.logaddexp(0.0, z), expit(z)
+    cum_hazard = np.exp(z)
+    return cum_hazard, cum_hazard
+
+
 class Model:
     """XGBoost survival model: Cox (``survival:cox``) or AFT (``survival:aft``).
 
     Cox survival curves use the Breslow baseline hazard estimated on the
-    training data; AFT curves assume the normal (log-normal time) distribution.
-    After ``calibrate`` the curves are corrected for unobserved heterogeneity
-    between drones (attribute ``calibration``).
+    training data; AFT curves follow the noise distribution set by
+    ``aft_loss_distribution``. After ``calibrate`` the curves are corrected for
+    unobserved heterogeneity between drones (attribute ``calibration``).
 
     Parameters
     ----------
@@ -362,7 +383,8 @@ class Model:
         ``"cox"`` or ``"aft"``.
     params : dict
         XGBoost booster parameters. For ``"aft"`` must contain
-        ``aft_loss_distribution_scale``.
+        ``aft_loss_distribution_scale``; ``aft_loss_distribution`` is one of
+        ``AFT_DISTRIBUTIONS`` and defaults to ``"normal"``.
     features : list[str]
         Feature columns used by the model.
     cat_features : list[str]
@@ -371,7 +393,8 @@ class Model:
     Raises
     ------
     ValueError
-        If ``kind`` is not ``"cox"`` or ``"aft"``.
+        If ``kind`` is not ``"cox"`` or ``"aft"``, or the AFT distribution is
+        not one of ``AFT_DISTRIBUTIONS``.
     """
 
     NUM_BOOST_ROUND = 2000
@@ -388,6 +411,11 @@ class Model:
             raise ValueError(f"kind must be 'cox' or 'aft', got {kind!r}")
         self.kind = kind
         self.params = dict(params)
+        if kind == "aft" and self._aft_distribution not in AFT_DISTRIBUTIONS:
+            raise ValueError(
+                f"aft_loss_distribution must be one of {AFT_DISTRIBUTIONS}, "
+                f"got {self._aft_distribution!r}"
+            )
         self.features = features
         self.cat_features = cat_features
         self.booster: xgb.Booster | None = None
@@ -395,6 +423,11 @@ class Model:
         self.history: dict[str, dict[str, list[float]]] = {}
         self._breslow: tuple[np.ndarray, np.ndarray] | None = None
         self.calibration: dict[str, float] | None = None
+
+    @property
+    def _aft_distribution(self) -> str:
+        """AFT noise distribution; parameters without the key mean ``"normal"``."""
+        return self.params.get("aft_loss_distribution", "normal")
 
     def _dmatrix(self, data: pd.DataFrame) -> xgb.DMatrix:
         """Build a labelled DMatrix for ``data``."""
@@ -441,7 +474,7 @@ class Model:
             objective, metric = "survival:aft", "aft-nloglik"
         params = {"objective": objective, "eval_metric": metric, **self.params}
         if self.kind == "aft":
-            params["aft_loss_distribution"] = "normal"
+            params["aft_loss_distribution"] = self._aft_distribution
         self.booster = xgb.train(
             params,
             dtrain,
@@ -638,8 +671,8 @@ class Model:
 
         sigma = self.params["aft_loss_distribution_scale"]
         with np.errstate(divide="ignore"):
-            log_times = np.log(times)
-        return -norm.logsf((log_times - margin[:, None]) / sigma)
+            z = (np.log(times) - margin[:, None]) / sigma
+        return _aft_noise(self._aft_distribution, z)[0]
 
     def _survival_at(self, margin: np.ndarray, times: np.ndarray) -> np.ndarray:
         """``S(t | x)`` from margins; ``times`` is ``(m,)`` shared or ``(n, m)`` per row."""
@@ -697,7 +730,7 @@ class Model:
     ) -> np.ndarray:
         """Hazard ``h(t | x)``: failure rate per flight hour among drones alive at t.
 
-        AFT uses the exact log-normal hazard. The Breslow baseline is a step
+        AFT uses the exact hazard of its distribution. The Breslow baseline is a step
         function, so for Cox its jumps are smoothed with an Epanechnikov kernel
         and scaled by ``exp(f(x))``; that estimate is biased downwards within
         ``bandwidth`` of 0 and of the last training event time. With
@@ -736,11 +769,10 @@ class Model:
             sigma = self.params["aft_loss_distribution_scale"]
             with np.errstate(divide="ignore"):
                 z = (np.log(times)[None, :] - margin[:, None]) / sigma
-            # pdf / sf in log space stays finite deep in the right tail.
             with np.errstate(divide="ignore", invalid="ignore"):
                 hazard = np.where(
                     times > 0,
-                    np.exp(norm.logpdf(z) - norm.logsf(z)) / (sigma * times),
+                    _aft_noise(self._aft_distribution, z)[1] / (sigma * times),
                     0.0,
                 )
         if self.calibration is None:
@@ -1158,7 +1190,8 @@ def tune(
     """Tune hyper-parameters with Optuna (TPE) on the validation integrated Brier score.
 
     The score uses ``evaluation_times(valid)`` and the censoring distribution of
-    ``valid``, so it stays inside the validation follow-up.
+    ``valid``, so it stays inside the validation follow-up. For AFT the search
+    also covers the noise distribution (``AFT_DISTRIBUTIONS``) and its scale.
 
     Parameters
     ----------
@@ -1193,6 +1226,9 @@ def tune(
         }
 
         if kind != "cox":
+            params["aft_loss_distribution"] = trial.suggest_categorical(
+                "aft_loss_distribution", list(AFT_DISTRIBUTIONS)
+            )
             params["aft_loss_distribution_scale"] = trial.suggest_float(
                 "aft_loss_distribution_scale",
                 0.2,

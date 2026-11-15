@@ -160,13 +160,13 @@ Both models are XGBoost gradient boosting with loss functions designed for censo
 | | Cox (`survival:cox`) | AFT (`survival:aft`) |
 |---|---|---|
 | What it predicts | How many times the drone's hazard is above average | How much the drone's lifetime is "stretched" or "compressed" |
-| Curve shape | A shared baseline hazard (Breslow estimator); each drone gets a power of it. Curves of different drones never cross | A log-normal time distribution shifted for each drone |
+| Curve shape | A shared baseline hazard (Breslow estimator); each drone gets a power of it. Curves of different drones never cross | A parametric time distribution (log-normal, log-logistic or Weibull, chosen by tuning) shifted for each drone |
 | Strength | Imposes no distribution shape | Can forecast beyond the observed times |
-| Weakness | The baseline is flat after the last training failure, so forecasts beyond that point are optimistic | If the real distribution is not log-normal, probabilities are biased |
+| Weakness | The baseline is flat after the last training failure, so forecasts beyond that point are optimistic | If the real distribution has a different shape, probabilities are biased |
 
 **Hyper-parameter tuning:**
 
-- Optuna, 20 trials per model;
+- Optuna, 20 trials per model; for AFT the search includes the time distribution;
 - the objective is the Integrated Brier score on validation, i.e. probability accuracy, not just ranking;
 - early stopping after 50 iterations without validation improvement.
 

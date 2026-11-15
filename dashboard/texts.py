@@ -346,8 +346,9 @@ $S(t \\mid x) = \\exp\\left(-H_0(t)\\, e^{{f(x)}}\\right)$.
 Assumption: the risk ratio of two drones does not change over time.
 
 **AFT (accelerated failure time).** The model predicts the logarithm of time to
-failure: $\\log T = f(x) + \\sigma \\varepsilon$, where $\\varepsilon$ is normal
-noise. Features "speed up" or "slow down" wear: a drone with $f(x)$ lower by 0.7
+failure: $\\log T = f(x) + \\sigma \\varepsilon$, where $\\varepsilon$ is noise
+with a normal, logistic or extreme-value distribution (chosen by tuning).
+Features "speed up" or "slow down" wear: a drone with $f(x)$ lower by 0.7
 lives about half as long. Assumption: the shape of the time distribution is the
 same for all drones.
 
@@ -529,6 +530,13 @@ HYPERPARAMS = {
         "L2 regularisation",
         ("Penalty for too large leaf predictions; higher makes the model more cautious."),
     ),
+    "aft_loss_distribution": (
+        "Noise distribution (AFT)",
+        (
+            "Shape of the failure time around the AFT model forecast: normal gives a "
+            "log-normal time, logistic a log-logistic time, extreme a Weibull time."
+        ),
+    ),
     "aft_loss_distribution_scale": (
         "Distribution σ (AFT)",
         ("Spread of the failure time around the AFT model forecast."),
@@ -676,9 +684,10 @@ FIGURES = {
         "details": "The fleet rate is the survival-weighted mean of the individual "
         "rates, $\\sum_i S_i(t) h_i(t) / \\sum_i S_i(t)$, because drones that already "
         "failed no longer contribute. Cox: $h(t|x) = h_0(t) e^{{f(x)}}$ with the "
-        "Breslow baseline smoothed by the same kernel as the observed rate. AFT "
-        "(log-normal): the exact hazard, which by construction rises and then falls, "
-        "so it cannot follow a flat observed rate.",
+        "Breslow baseline smoothed by the same kernel as the observed rate. AFT: the "
+        "exact hazard of its time distribution, whose shape is fixed by the tuned "
+        "noise distribution: log-normal rises and then falls, log-logistic falls or "
+        "has one peak, Weibull only rises or only falls.",
     },
     "individual_curves": {
         "what": "Survival forecast for five random test drones from both models "
@@ -859,8 +868,8 @@ FIGURES = {
         "(bandwidth {hazard_bandwidth:.0f} h) times the drone's relative risk, so all "
         "Cox curves have the same shape; at high flight hours it rests on few training "
         "failures and becomes noisy, so the chart stops at the fleet range or at the "
-        "drone's next {window:.0f} h, whichever is later. AFT: the exact log-normal "
-        "hazard. "
+        "drone's next {window:.0f} h, whichever is later. AFT: the exact hazard of its "
+        "time distribution. "
         "The conditional survival is $S(a+u)/S(a) = \\exp(-\\int_a^{{a+u}} h(t)\\,dt)$: "
         "the area under this curve after the line drives the remaining-life forecast.",
     },

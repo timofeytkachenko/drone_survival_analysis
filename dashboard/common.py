@@ -226,7 +226,12 @@ def hyperparams_frame(models: dict[str, Model]) -> pd.DataFrame:
                 else {**model.params, **(model.calibration or {})}.get(key)
             )
             present |= value is not None
-            row[MODEL_LABELS[kind]] = "—" if value is None else f"{value:.4g}"
+            if value is None:
+                row[MODEL_LABELS[kind]] = "—"
+            else:
+                row[MODEL_LABELS[kind]] = (
+                    value if isinstance(value, str) else f"{value:.4g}"
+                )
         if present:
             rows.append(row)
     return pd.DataFrame(rows)
