@@ -1,5 +1,7 @@
+.streamlit/
 __pycache__/
 .ruff_cache/
 .venv/
 data/
 models/
+artifacts/

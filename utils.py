@@ -1,13 +1,22 @@
 import json
 import logging
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
 import optuna
 import pandas as pd
+import shap
 import xgboost as xgb
 from scipy.stats import norm
-from sksurv.metrics import integrated_brier_score
+from sksurv.metrics import (
+    brier_score,
+    concordance_index_censored,
+    concordance_index_ipcw,
+    cumulative_dynamic_auc,
+    integrated_brier_score,
+)
+from sksurv.nonparametric import kaplan_meier_estimator
 from sksurv.util import Surv
 
 logger = logging.getLogger(__name__)
@@ -213,6 +222,74 @@ def _breslow_baseline(
     return ev_times, np.cumsum(deaths / at_risk)
 
 
+def _epanechnikov(grid: np.ndarray, times: np.ndarray, bandwidth: float) -> np.ndarray:
+    """Kernel weights ``K((grid - times) / b) / b``, shape ``(len(grid), len(times))``."""
+    z = (np.asarray(grid, dtype=float)[:, None] - times[None, :]) / bandwidth
+    return np.where(np.abs(z) < 1, 0.75 * (1 - z**2), 0.0) / bandwidth
+
+
+def hazard_bandwidth(time: np.ndarray, event: np.ndarray) -> float:
+    """Kernel bandwidth for hazard smoothing: Silverman's rule on the event times.
+
+    Parameters
+    ----------
+    time : numpy.ndarray
+        Observed durations.
+    event : numpy.ndarray
+        Boolean event indicators (True = failure).
+
+    Returns
+    -------
+    float
+        Bandwidth in the units of ``time``.
+
+    Raises
+    ------
+    ValueError
+        If there are fewer than two events.
+    """
+    t = np.asarray(time, dtype=float)[np.asarray(event, dtype=bool)]
+    if len(t) < 2:
+        raise ValueError("At least two events are needed to choose a bandwidth")
+    iqr = np.subtract(*np.quantile(t, [0.75, 0.25]))
+    spread = min(t.std(ddof=1), iqr / 1.34) if iqr > 0 else t.std(ddof=1)
+    return float(0.9 * spread * len(t) ** -0.2)
+
+
+def observed_hazard(
+    time: np.ndarray, event: np.ndarray, grid: np.ndarray, bandwidth: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Kernel-smoothed Nelson-Aalen hazard with a pointwise 95% interval.
+
+    Estimates are biased downwards within ``bandwidth`` of 0 and of the last
+    event time (the kernel loses mass there), so keep ``grid`` away from them.
+
+    Parameters
+    ----------
+    time : numpy.ndarray
+        Observed durations.
+    event : numpy.ndarray
+        Boolean event indicators (True = failure).
+    grid : numpy.ndarray
+        Evaluation times.
+    bandwidth : float
+        Epanechnikov kernel half-width, in the units of ``time``.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        Hazard per unit of time, lower and upper 95% bounds (lower clipped at 0).
+    """
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event, dtype=bool)
+    ev_times, deaths = np.unique(time[event], return_counts=True)
+    at_risk = len(time) - np.searchsorted(np.sort(time), ev_times, side="left")
+    weights = _epanechnikov(grid, ev_times, bandwidth)
+    hazard = weights @ (deaths / at_risk)
+    se = np.sqrt(weights**2 @ (deaths / at_risk**2))
+    return hazard, np.maximum(hazard - 1.96 * se, 0.0), hazard + 1.96 * se
+
+
 class Model:
     """XGBoost survival model: Cox (``survival:cox``) or AFT (``survival:aft``).
 
@@ -323,6 +400,78 @@ class Model:
             )
         return self
 
+    def _predict_margin(self, data: pd.DataFrame) -> np.ndarray:
+        """Best-iteration margin for raw rows; requires a fitted model."""
+        if self.booster is None or self.categories is None:
+            raise RuntimeError("Model.fit must be called before predicting")
+        X = _features_frame(data, self.features, self.categories)
+        return self._margin(xgb.DMatrix(X, enable_categorical=True))
+
+    def risk(self, data: pd.DataFrame) -> np.ndarray:
+        """Risk score for ranking metrics: higher means earlier expected failure.
+
+        Log hazard ratio for Cox, negative predicted log-time for AFT.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Rows with the ``features`` columns.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape ``(len(data),)``.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        margin = self._predict_margin(data)
+        return margin if self.kind == "cox" else -margin
+
+    def explain(self, data: pd.DataFrame) -> shap.Explanation:
+        """TreeSHAP values of the ``risk`` score.
+
+        Uses the trees up to the early-stopping best iteration, like ``risk``.
+        AFT values are negated, so for both kinds a positive SHAP value pushes
+        towards earlier failure. Categorical features are passed to ``shap`` as
+        integer codes (NaN for unseen levels) so plots can colour by them.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Rows with the ``features`` columns.
+
+        Returns
+        -------
+        shap.Explanation
+            SHAP values of shape ``(len(data), len(features))``.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if self.booster is None or self.categories is None:
+            raise RuntimeError("Model.fit must be called before explain")
+        X = _features_frame(data, self.features, self.categories)
+        explainer = shap.TreeExplainer(self.booster)
+        sign = 1.0 if self.kind == "cox" else -1.0
+        numeric = X.apply(
+            lambda col: (
+                col.cat.codes.where(col.cat.codes >= 0)
+                if isinstance(col.dtype, pd.CategoricalDtype)
+                else col
+            )
+        ).astype(float)
+        return shap.Explanation(
+            values=sign * explainer.shap_values(X),
+            base_values=np.full(len(X), sign * float(explainer.expected_value)),
+            data=numeric.to_numpy(),
+            feature_names=list(X.columns),
+        )
+
     def survival(self, data: pd.DataFrame, times: np.ndarray) -> np.ndarray:
         """Predicted survival probabilities ``S(t | x)``.
 
@@ -343,20 +492,117 @@ class Model:
         RuntimeError
             If the model has not been fitted.
         """
-        if self.booster is None or self.categories is None:
-            raise RuntimeError("Model.fit must be called before survival")
-        X = _features_frame(data, self.features, self.categories)
-        margin = self._margin(xgb.DMatrix(X, enable_categorical=True))
-        times = np.asarray(times, dtype=float)
+        return self._survival_at(self._predict_margin(data), times)
+
+    def _survival_at(self, margin: np.ndarray, times: np.ndarray) -> np.ndarray:
+        """``S(t | x)`` from margins; ``times`` is ``(m,)`` shared or ``(n, m)`` per row."""
+        times = np.atleast_2d(np.asarray(times, dtype=float))
 
         if self.kind == "cox":
             ev_times, h0 = self._breslow
             idx = np.searchsorted(ev_times, times, side="right")
             cum_hazard = np.where(idx > 0, h0[np.maximum(idx - 1, 0)], 0.0)
-            return np.exp(-np.outer(np.exp(margin), cum_hazard))
+            return np.exp(-np.exp(margin)[:, None] * cum_hazard)
 
         sigma = self.params["aft_loss_distribution_scale"]
-        return norm.sf((np.log(times)[None, :] - margin[:, None]) / sigma)
+        with np.errstate(divide="ignore"):
+            log_times = np.log(times)
+        return norm.sf((log_times - margin[:, None]) / sigma)
+
+    def conditional_survival(
+        self, data: pd.DataFrame, ages: np.ndarray, times: np.ndarray
+    ) -> np.ndarray:
+        """Survival for ``times`` more hours given survival up to ``ages``.
+
+        ``S(a + u | x) / S(a | x)``; valid because features are fixed at
+        commissioning. For Cox the Breslow baseline is flat after the last
+        training event time, so curves beyond it are optimistic (a warning is
+        logged).
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Rows with the ``features`` columns.
+        ages : numpy.ndarray
+            Flight hours already survived, one per row.
+        times : numpy.ndarray
+            Additional flight hours ``u >= 0``, shared by all rows.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape ``(len(data), len(times))``; NaN where ``S(a) = 0``.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        margin = self._predict_margin(data)
+        ages = np.asarray(ages, dtype=float)[:, None]
+        times = np.asarray(times, dtype=float)[None, :]
+        if self.kind == "cox" and (ages + times).max() > self._breslow[0][-1]:
+            logger.warning(
+                "Cox baseline hazard is flat after %.0f h; conditional survival "
+                "beyond it is optimistic",
+                self._breslow[0][-1],
+            )
+        s_age = self._survival_at(margin, ages)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(
+                s_age > 0, self._survival_at(margin, ages + times) / s_age, np.nan
+            )
+
+    def hazard(
+        self, data: pd.DataFrame, times: np.ndarray, bandwidth: float | None = None
+    ) -> np.ndarray:
+        """Hazard ``h(t | x)``: failure rate per flight hour among drones alive at t.
+
+        AFT uses the exact log-normal hazard. The Breslow baseline is a step
+        function, so for Cox its jumps are smoothed with an Epanechnikov kernel
+        and scaled by ``exp(f(x))``; that estimate is biased downwards within
+        ``bandwidth`` of 0 and of the last training event time.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Rows with the ``features`` columns.
+        times : numpy.ndarray
+            Evaluation times in flight hours.
+        bandwidth : float, optional
+            Kernel half-width in flight hours; required for Cox, ignored for AFT.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape ``(len(data), len(times))``.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        ValueError
+            If ``bandwidth`` is missing for a Cox model.
+        """
+        margin = self._predict_margin(data)
+        times = np.asarray(times, dtype=float)
+        if self.kind == "cox":
+            if bandwidth is None:
+                raise ValueError("bandwidth is required for the Cox hazard")
+            ev_times, h0 = self._breslow
+            baseline = _epanechnikov(times, ev_times, bandwidth) @ np.diff(h0, prepend=0.0)
+            return np.exp(margin)[:, None] * baseline[None, :]
+
+        sigma = self.params["aft_loss_distribution_scale"]
+        with np.errstate(divide="ignore"):
+            z = (np.log(times)[None, :] - margin[:, None]) / sigma
+        # pdf / sf in log space stays finite deep in the right tail.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(
+                times > 0,
+                np.exp(norm.logpdf(z) - norm.logsf(z)) / (sigma * times),
+                0.0,
+            )
 
     def save(self, path: str | Path) -> None:
         """Save the fitted model, including the state ``survival`` needs, as JSON.
@@ -418,6 +664,313 @@ class Model:
         return model
 
 
+def _surv(data: pd.DataFrame) -> np.ndarray:
+    """Structured ``(event, time)`` array expected by ``sksurv`` metrics."""
+    return Surv.from_arrays(data["event"].astype(bool), data["duration_h"])
+
+
+SCALAR_METRICS = ("c_index", "c_index_ipcw", "mean_auc", "ibs")
+LOWER_IS_BETTER = {
+    "c_index": False,
+    "c_index_ipcw": False,
+    "mean_auc": False,
+    "ibs": True,
+}
+
+
+def _scalar_metrics(
+    y_train: np.ndarray,
+    y: np.ndarray,
+    surv: np.ndarray,
+    risk: np.ndarray,
+    times: np.ndarray,
+) -> dict[str, float]:
+    """``SCALAR_METRICS`` from precomputed survival probabilities and risk scores."""
+    _, mean_auc = cumulative_dynamic_auc(y_train, y, 1 - surv, times)
+    return {
+        "c_index": concordance_index_censored(y["event"], y["time"], risk)[0],
+        "c_index_ipcw": concordance_index_ipcw(y_train, y, risk, tau=times[-1])[0],
+        "mean_auc": mean_auc,
+        "ibs": integrated_brier_score(y_train, y, surv, times),
+    }
+
+
+def evaluate(
+    model: Model, train: pd.DataFrame, data: pd.DataFrame, times: np.ndarray
+) -> dict[str, float | np.ndarray]:
+    """Discrimination and calibration metrics of ``model`` on ``data``.
+
+    IPCW-based metrics estimate the censoring distribution on ``train`` with
+    Kaplan-Meier, i.e. they assume censoring independent of the features.
+
+    Parameters
+    ----------
+    model : Model
+        Fitted model.
+    train : pd.DataFrame
+        Training rows, used only for the censoring distribution.
+    data : pd.DataFrame
+        Rows to evaluate on.
+    times : numpy.ndarray
+        Increasing evaluation times inside the follow-up range of ``data``
+        (``sksurv`` requires ``min <= t < max`` of its durations).
+
+    Returns
+    -------
+    dict[str, float | numpy.ndarray]
+        Scalars ``c_index`` (Harrell), ``c_index_ipcw`` (Uno, truncated at
+        ``times[-1]``), ``mean_auc`` and ``ibs``; per-time arrays ``brier``
+        and ``auc`` aligned with ``times``.
+    """
+    y_train, y = _surv(train), _surv(data)
+    surv = model.survival(data, times)
+    _, brier = brier_score(y_train, y, surv, times)
+    auc, _ = cumulative_dynamic_auc(y_train, y, 1 - surv, times)
+    return {
+        **_scalar_metrics(y_train, y, surv, model.risk(data), times),
+        "brier": brier,
+        "auc": auc,
+    }
+
+
+def bootstrap_compare(
+    models: dict[str, Model],
+    train: pd.DataFrame,
+    data: pd.DataFrame,
+    times: np.ndarray,
+    n_boot: int = 1000,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Paired bootstrap comparison of fitted models on ``data``.
+
+    Every replicate resamples rows of ``data`` with replacement and scores all
+    models on the same rows, so metric differences account for the correlation
+    between models. Models are fixed: the intervals reflect evaluation-set
+    sampling noise only, not refitting variability.
+
+    Parameters
+    ----------
+    models : dict[str, Model]
+        Fitted models keyed by name; every pair is compared.
+    train : pd.DataFrame
+        Training rows, used only for the IPCW censoring distribution.
+    data : pd.DataFrame
+        Evaluation rows (e.g. the test split).
+    times : numpy.ndarray
+        Evaluation times, as in ``evaluate``.
+    n_boot : int, default 1000
+        Number of bootstrap replicates.
+    seed : int, default 0
+        Seed for ``numpy.random.default_rng``.
+
+    Returns
+    -------
+    summary : pd.DataFrame
+        One row per model pair and metric: point estimates ``value_a`` and
+        ``value_b``, ``diff = value_a - value_b``, 95% percentile interval of
+        the difference (``ci_low``, ``ci_high``), two-sided bootstrap
+        ``p_value`` (resolution ``2 / n_boot``; 0 means below it), the
+        ``better`` model by point estimate and ``significant`` (interval
+        excludes 0).
+    samples : pd.DataFrame
+        Bootstrap replicates, columns ``(model, metric)``.
+    """
+    y_train, y = _surv(train), _surv(data)
+    preds = {
+        name: (model.survival(data, times), model.risk(data))
+        for name, model in models.items()
+    }
+    point = {
+        name: _scalar_metrics(y_train, y, surv, risk, times)
+        for name, (surv, risk) in preds.items()
+    }
+
+    rng = np.random.default_rng(seed)
+    records = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(y), len(y))
+        records.append(
+            {
+                (name, metric): value
+                for name, (surv, risk) in preds.items()
+                for metric, value in _scalar_metrics(
+                    y_train, y[idx], surv[idx], risk[idx], times
+                ).items()
+            }
+        )
+    samples = pd.DataFrame(records)
+    samples.columns = pd.MultiIndex.from_tuples(
+        samples.columns, names=["model", "metric"]
+    )
+
+    rows = []
+    for a, b in combinations(models, 2):
+        for metric in SCALAR_METRICS:
+            diff_boot = samples[(a, metric)] - samples[(b, metric)]
+            diff = point[a][metric] - point[b][metric]
+            ci_low, ci_high = np.quantile(diff_boot, [0.025, 0.975])
+            p_value = min(
+                1.0, 2 * min((diff_boot <= 0).mean(), (diff_boot >= 0).mean())
+            )
+            a_better = (diff < 0) if LOWER_IS_BETTER[metric] else (diff > 0)
+            rows.append(
+                {
+                    "model_a": a,
+                    "model_b": b,
+                    "metric": metric,
+                    "value_a": point[a][metric],
+                    "value_b": point[b][metric],
+                    "diff": diff,
+                    "ci_low": ci_low,
+                    "ci_high": ci_high,
+                    "p_value": p_value,
+                    "better": a if a_better else b,
+                    "significant": not ci_low <= 0 <= ci_high,
+                }
+            )
+    return pd.DataFrame(rows), samples
+
+
+def calibration_curve(
+    model: Model, data: pd.DataFrame, horizon: float, n_bins: int = 10
+) -> pd.DataFrame:
+    """Predicted vs observed survival at ``horizon`` by quantile bins of the prediction.
+
+    Observed survival in each bin is the Kaplan-Meier estimate at ``horizon``.
+    If a bin has no follow-up up to ``horizon``, its last Kaplan-Meier value is
+    used, so keep ``horizon`` well inside the follow-up range.
+
+    Parameters
+    ----------
+    model : Model
+        Fitted model.
+    data : pd.DataFrame
+        Rows with ``duration_h``, ``event`` and the model features.
+    horizon : float
+        Time point in flight hours.
+    n_bins : int, default 10
+        Number of quantile bins; fewer are used if predictions have ties.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``predicted`` (mean predicted S), ``observed`` (Kaplan-Meier S)
+        and ``n`` (rows in the bin), one row per bin.
+    """
+    pred = model.survival(data, np.array([horizon]))[:, 0]
+    bins = pd.qcut(pred, n_bins, labels=False, duplicates="drop")
+    event = data["event"].to_numpy().astype(bool)
+    time = data["duration_h"].to_numpy()
+    rows = []
+    for b in np.unique(bins):
+        mask = bins == b
+        km_time, km_surv = kaplan_meier_estimator(event[mask], time[mask])
+        seen = km_time <= horizon
+        rows.append(
+            {
+                "predicted": pred[mask].mean(),
+                "observed": km_surv[seen][-1] if seen.any() else 1.0,
+                "n": int(mask.sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def population_hazard(
+    model: Model, data: pd.DataFrame, times: np.ndarray, bandwidth: float
+) -> np.ndarray:
+    """Predicted hazard of the whole group, comparable with ``observed_hazard``.
+
+    Drones that already failed leave the risk set, so the group hazard is the
+    survival-weighted mean ``sum S_i h_i / sum S_i``, not the plain mean of ``h_i``.
+
+    Parameters
+    ----------
+    model : Model
+        Fitted model.
+    data : pd.DataFrame
+        Rows with the model features.
+    times : numpy.ndarray
+        Evaluation times in flight hours.
+    bandwidth : float
+        Kernel half-width passed to ``Model.hazard`` (used by Cox only).
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape ``(len(times),)``; NaN where every drone has ``S = 0``.
+    """
+    surv = model.survival(data, times)
+    weighted = (surv * model.hazard(data, times, bandwidth)).sum(axis=0)
+    total = surv.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(total > 0, weighted / total, np.nan)
+
+
+def remaining_life(
+    model: Model,
+    data: pd.DataFrame,
+    horizon: float,
+    window: float = 100.0,
+    n_grid: int = 1001,
+) -> pd.DataFrame:
+    """Remaining useful life of drones still in service.
+
+    Uses the conditional survival ``S(a + u | x) / S(a | x)`` with the current
+    age ``a = duration_h`` (flight hours survived so far).
+
+    Parameters
+    ----------
+    model : Model
+        Fitted model.
+    data : pd.DataFrame
+        Drones in service: ``drone_id``, ``duration_h`` and the model features.
+    horizon : float
+        Maximum additional flight hours considered.
+    window : float, default 100.0
+        Look-ahead window for ``p_fail_window``.
+    n_grid : int, default 1001
+        Grid points on ``[0, horizon]``; RUL resolution is
+        ``horizon / (n_grid - 1)``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed like ``data`` with ``drone_id``, ``age_h``, ``rul_q10`` (hours
+        until failure probability reaches 10%), ``rul_median`` (50%),
+        ``rmrl`` (mean residual life restricted to ``horizon``) and
+        ``p_fail_window`` (failure probability within ``window`` hours).
+        ``rul_*`` is ``inf`` when the level is not reached within ``horizon``.
+
+    Raises
+    ------
+    ValueError
+        If ``window`` is not in ``(0, horizon]``.
+    """
+    if not 0 < window <= horizon:
+        raise ValueError("window must be in (0, horizon]")
+    ages = data["duration_h"].to_numpy(dtype=float)
+    grid = np.linspace(0.0, horizon, n_grid)
+    surv = model.conditional_survival(data, ages, grid)
+
+    def first_crossing(level: float) -> np.ndarray:
+        reached = surv <= level
+        return np.where(reached.any(axis=1), grid[reached.argmax(axis=1)], np.inf)
+
+    p_survive_window = model.conditional_survival(data, ages, np.array([window]))[:, 0]
+    return pd.DataFrame(
+        {
+            "drone_id": data["drone_id"].to_numpy(),
+            "age_h": ages,
+            "rul_q10": first_crossing(0.9),
+            "rul_median": first_crossing(0.5),
+            "rmrl": np.trapezoid(surv, grid, axis=1),
+            "p_fail_window": 1.0 - p_survive_window,
+        },
+        index=data.index,
+    )
+
+
 def tune(
     kind: str,
     train: pd.DataFrame,
@@ -444,42 +997,29 @@ def tune(
     Model
         Model refitted with the best parameters.
     """
-    y_train = Surv.from_arrays(train["event"].astype(bool), train["duration_h"])
-    y_valid = Surv.from_arrays(valid["event"].astype(bool), valid["duration_h"])
+    y_train = _surv(train)
+    y_valid = _surv(valid)
     TIMES = np.quantile(train["duration_h"], np.linspace(0.1, 0.9, 9))
 
     def objective(trial):
 
         params = {
-            "max_depth": trial.suggest_int(
-                "max_depth", 2, 5
-            ),
-            "eta": trial.suggest_float(
-                "eta", 0.025, 0.15, log=True
-            ),
+            "max_depth": trial.suggest_int("max_depth", 2, 5),
+            "eta": trial.suggest_float("eta", 0.025, 0.15, log=True),
             "min_child_weight": trial.suggest_float(
                 "min_child_weight", 1, 30, log=True
             ),
-            "subsample": trial.suggest_float(
-                "subsample", 0.7, 1.0
-            ),
-            "colsample_bytree": trial.suggest_float(
-                "colsample_bytree", 0.7, 1.0
-            ),
-            "reg_lambda": trial.suggest_float(
-                "reg_lambda", 0.1, 20, log=True
-            ),
+            "subsample": trial.suggest_float("subsample", 0.7, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 20, log=True),
         }
 
         if kind != "cox":
-
-            params["aft_loss_distribution_scale"] = (
-                trial.suggest_float(
-                    "aft_loss_distribution_scale",
-                    0.2,
-                    1.2,
-                    log=True,
-                )
+            params["aft_loss_distribution_scale"] = trial.suggest_float(
+                "aft_loss_distribution_scale",
+                0.2,
+                1.2,
+                log=True,
             )
 
         model = Model(kind, params, features, cat_features).fit(train, valid)
@@ -495,9 +1035,7 @@ def tune(
 
     study = optuna.create_study(
         direction="minimize",
-        sampler=optuna.samplers.TPESampler(
-            seed=42
-        ),
+        sampler=optuna.samplers.TPESampler(seed=42),
     )
 
     study.optimize(
