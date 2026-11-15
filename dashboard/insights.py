@@ -516,6 +516,30 @@ def backtest(table: pd.DataFrame, landmark: float) -> list[str]:
     return out
 
 
+def backtest_groups(table: pd.DataFrame, best: str) -> list[str]:
+    """Agreement of predicted and observed failure shares across prediction quintiles."""
+    out = []
+    riskiest = table[table["quintile"] == table["quintile"].max()].set_index("source")
+    for kind, rows in table[table["source"] != "raw"].groupby("source", sort=False):
+        inside = rows["predicted"].between(rows["ci_low"], rows["ci_high"]).sum()
+        gap = (rows["predicted"] - rows["observed"]).abs()
+        top = riskiest.loc[kind]
+        out.append(
+            f"{MODEL_LABELS[kind]}: the forecast lies inside the 95% interval of the "
+            f"observed share in **{inside} of {len(rows)}** groups; mean gap "
+            f"{np.average(gap, weights=rows['n']) * 100:.1f} pp. Riskiest group: "
+            f"predicted {top['predicted']:.0%}, observed {top['observed']:.0%} "
+            f"(interval {top['ci_low']:.0%}–{top['ci_high']:.0%})."
+        )
+    if "raw" in riskiest.index:
+        before, after = riskiest.loc["raw", "predicted"], riskiest.loc[best, "predicted"]
+        out.append(
+            f"Before the recalibration {MODEL_LABELS[best]} predicted {before:.0%} for "
+            f"its riskiest group; the recalibration changes it to {after:.0%}."
+        )
+    return out
+
+
 def drone(
     row: pd.Series,
     contrib: pd.DataFrame,
@@ -540,8 +564,14 @@ def drone(
             f"a median time to failure of {hours_text(predicted_median)}; the failure "
             f"happened {timing} the median."
         )
+    elif not row["in_service"]:
+        out.append(
+            f"The drone **left the fleet** without a failure after "
+            f"{row['duration_h']:.0f} flight hours (sold, lost or retired), so it has "
+            "no remaining-life forecast."
+        )
     else:
-        active = pred[pred["event"] == 0]
+        active = pred[pred["in_service"]]
         rank = int((active["p_fail_window"] > row["p_fail_window"]).sum()) + 1
         out.append(
             f"The drone is **in service** with {row['duration_h']:.0f} h flown without "

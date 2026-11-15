@@ -490,6 +490,68 @@ def backtest(table: pd.DataFrame, landmark: float) -> go.Figure:
     )
 
 
+def backtest_groups(
+    table: pd.DataFrame, best: str, window: float, landmark: float
+) -> go.Figure:
+    """Predicted vs observed failure probability within ``window`` by prediction quintile.
+
+    ``table`` has one row per ``source`` and quintile; ``source`` is a model kind or
+    ``"raw"`` for the best model before recalibration. The interval of the observed
+    share is drawn for the best model only.
+    """
+    top = 1.1 * table[["predicted", "ci_high"]].to_numpy().max()
+    fig = go.Figure(
+        go.Scatter(
+            x=[0, top],
+            y=[0, top],
+            mode="lines",
+            name="Perfect calibration",
+            line={"color": "grey", "dash": "dot"},
+        )
+    )
+    for source, rows in table.groupby("source", sort=False):
+        raw = source == "raw"
+        kind = best if raw else source
+        fig.add_trace(
+            go.Scatter(
+                x=rows["predicted"],
+                y=rows["observed"],
+                mode="lines+markers",
+                name=(
+                    f"{MODEL_LABELS[kind]} before recalibration"
+                    if raw
+                    else MODEL_LABELS[kind]
+                ),
+                line=(
+                    {"color": "grey", "dash": "dash"}
+                    if raw
+                    else {"color": MODEL_COLORS[kind]}
+                ),
+                error_y=(
+                    {
+                        "type": "data",
+                        "symmetric": False,
+                        "array": rows["ci_high"] - rows["observed"],
+                        "arrayminus": rows["observed"] - rows["ci_low"],
+                        "thickness": 1,
+                    }
+                    if source == best
+                    else None
+                ),
+                customdata=rows["n"],
+                hovertemplate="predicted %{x:.1%}, observed %{y:.1%}, n=%{customdata}<extra></extra>",
+            )
+        )
+    fig.update_xaxes(range=[0, top], tickformat=".0%")
+    fig.update_yaxes(range=[0, top], tickformat=".0%")
+    return _style(
+        fig,
+        f"Backtest by risk group: failure within {window:.0f} h after {landmark:.0f} h",
+        "Predicted probability",
+        "Observed share (Kaplan-Meier)",
+    )
+
+
 # --- Risk factors -------------------------------------------------------------
 
 

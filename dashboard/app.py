@@ -561,9 +561,42 @@ def fleet_tab() -> dbc.Container:
                 ],
             ),
             html.H5("Step 3. Can the remaining-life forecast be trusted"),
-            _graph(figures.backtest(TABLES["backtest"], META["landmark"])),
-            _explain(
-                "backtest", insights.backtest(TABLES["backtest"], META["landmark"])
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            _graph(
+                                figures.backtest(TABLES["backtest"], META["landmark"])
+                            ),
+                            _explain(
+                                "backtest",
+                                insights.backtest(
+                                    TABLES["backtest"], META["landmark"]
+                                ),
+                            ),
+                        ],
+                        md=6,
+                    ),
+                    dbc.Col(
+                        [
+                            _graph(
+                                figures.backtest_groups(
+                                    TABLES["backtest_groups"],
+                                    BEST,
+                                    WINDOW,
+                                    META["landmark"],
+                                )
+                            ),
+                            _explain(
+                                "backtest_groups",
+                                insights.backtest_groups(
+                                    TABLES["backtest_groups"], BEST
+                                ),
+                            ),
+                        ],
+                        md=6,
+                    ),
+                ],
             ),
         ],
         fluid=True,
@@ -827,7 +860,7 @@ def update_drone(drone_id: str):
     row = rows.iloc[0]
     failed = bool(row["event"])
     info = [html.H4(drone_id), html.P(common.drone_status(row), className="fw-bold")]
-    if not failed:
+    if row["in_service"]:
         info.append(
             dbc.Table(
                 html.Tbody(

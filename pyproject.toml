@@ -19,6 +19,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "shap>=0.54.1",
     "streamlit>=1.67.0",
+    "watchdog>=7.1.0",
     "xgboost>=3.4.1",
 ]
 

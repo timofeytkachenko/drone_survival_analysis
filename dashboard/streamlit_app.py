@@ -411,8 +411,20 @@ def fleet_tab() -> None:
         )
         _explain("riskiest")
     st.subheader("Step 3. Can the remaining-life forecast be trusted")
-    _plot(figures.backtest(TABLES["backtest"], META["landmark"]))
-    _explain("backtest", insights.backtest(TABLES["backtest"], META["landmark"]))
+    left, right = st.columns(2)
+    with left:
+        _plot(figures.backtest(TABLES["backtest"], META["landmark"]))
+        _explain("backtest", insights.backtest(TABLES["backtest"], META["landmark"]))
+    with right:
+        _plot(
+            figures.backtest_groups(
+                TABLES["backtest_groups"], BEST, SETTINGS.window, META["landmark"]
+            )
+        )
+        _explain(
+            "backtest_groups",
+            insights.backtest_groups(TABLES["backtest_groups"], BEST),
+        )
 
 
 def _whatif_key(drone_id: str, feature: str) -> str:
@@ -498,7 +510,7 @@ def drone_tab() -> None:
     left, right = st.columns([4, 8])
     with left:
         st.markdown(f"#### {drone_id}\n\n**{common.drone_status(row)}**")
-        if not failed:
+        if row["in_service"]:
             st.table(
                 pd.DataFrame(
                     common.drone_metrics(row, SETTINGS),

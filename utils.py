@@ -8,6 +8,7 @@ import optuna
 import pandas as pd
 import shap
 import xgboost as xgb
+from scipy.optimize import minimize
 from scipy.stats import norm
 from sksurv.metrics import (
     brier_score,
@@ -290,11 +291,70 @@ def observed_hazard(
     return hazard, np.maximum(hazard - 1.96 * se, 0.0), hazard + 1.96 * se
 
 
+def _frailty_link(
+    cum_hazard: np.ndarray, frailty_variance: float, scale: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gamma-frailty link ``log(1 + v * scale * H) / v`` and its derivative in ``H``.
+
+    It is the cumulative hazard of a group whose members have cumulative hazard
+    ``Z * scale * H`` with an unobserved ``Z ~ Gamma(mean 1, variance v)``. The
+    limit ``v -> 0`` is ``scale * H``.
+    """
+    x = scale * np.asarray(cum_hazard, dtype=float)
+    if frailty_variance < 1e-8:
+        return x, np.full_like(x, scale)
+    return (
+        np.log1p(frailty_variance * x) / frailty_variance,
+        scale / (1.0 + frailty_variance * x),
+    )
+
+
+def _fit_frailty_link(cum_hazard: np.ndarray, event: np.ndarray) -> dict[str, float]:
+    """Maximum-likelihood parameters of ``_frailty_link`` on right-censored data.
+
+    Parameters
+    ----------
+    cum_hazard : numpy.ndarray
+        Predicted cumulative hazard of each row at its observed duration.
+    event : numpy.ndarray
+        Boolean event indicators (True = failure).
+
+    Returns
+    -------
+    dict[str, float]
+        ``frailty_variance`` (>= 0) and ``scale`` (> 0).
+
+    Raises
+    ------
+    RuntimeError
+        If the optimiser does not converge.
+    """
+
+    def negative_log_likelihood(params: np.ndarray) -> float:
+        linked, slope = _frailty_link(cum_hazard, params[0], np.exp(params[1]))
+        return linked.sum() - np.log(slope[event]).sum()
+
+    result = minimize(
+        negative_log_likelihood,
+        x0=[0.1, 0.0],
+        method="L-BFGS-B",
+        bounds=[(0.0, None), (None, None)],
+    )
+    if not result.success:
+        raise RuntimeError(f"Frailty link did not converge: {result.message}")
+    return {
+        "frailty_variance": float(result.x[0]),
+        "scale": float(np.exp(result.x[1])),
+    }
+
+
 class Model:
     """XGBoost survival model: Cox (``survival:cox``) or AFT (``survival:aft``).
 
     Cox survival curves use the Breslow baseline hazard estimated on the
     training data; AFT curves assume the normal (log-normal time) distribution.
+    After ``calibrate`` the curves are corrected for unobserved heterogeneity
+    between drones (attribute ``calibration``).
 
     Parameters
     ----------
@@ -334,6 +394,7 @@ class Model:
         self.categories: dict[str, list] | None = None
         self.history: dict[str, dict[str, list[float]]] = {}
         self._breslow: tuple[np.ndarray, np.ndarray] | None = None
+        self.calibration: dict[str, float] | None = None
 
     def _dmatrix(self, data: pd.DataFrame) -> xgb.DMatrix:
         """Build a labelled DMatrix for ``data``."""
@@ -369,6 +430,7 @@ class Model:
         Model
             The fitted model (``self``).
         """
+        self.calibration = None
         self.categories = fit_categories(train, self.cat_features)
         dtrain = self._dmatrix(train)
         dvalid = self._dmatrix(valid)
@@ -398,6 +460,73 @@ class Model:
                 train["event"].to_numpy().astype(bool),
                 risk,
             )
+        return self
+
+    def calibrate(
+        self,
+        train: pd.DataFrame,
+        valid: pd.DataFrame,
+        n_folds: int = 5,
+        seed: int = 0,
+    ) -> "Model":
+        """Correct the survival curves for unobserved heterogeneity between drones.
+
+        Drones with the same features still differ in durability. The weaker ones
+        fail first, so the survivors of a high-risk group are sturdier than their
+        features suggest, and a model without this effect overstates their hazard
+        at later ages. The correction replaces the predicted cumulative hazard
+        ``H(t | x)`` with ``log(1 + v * scale * H) / v`` (gamma frailty with
+        variance ``v``); ``v = 0`` with ``scale = 1`` leaves the model unchanged.
+        It applies to ``survival``, ``conditional_survival`` and ``hazard``; the
+        ranking of drones at a fixed time does not change.
+
+        ``v`` and ``scale`` are fitted by maximum likelihood on out-of-fold
+        predictions for ``train``: the model is refitted ``n_folds`` times with
+        the same parameters and each drone is predicted by the fit that did not
+        see it. In-sample predictions would hide the effect.
+
+        Parameters
+        ----------
+        train : pd.DataFrame
+            Training rows with ``duration_h`` and ``event``.
+        valid : pd.DataFrame
+            Validation rows, used for early stopping of the fold fits.
+        n_folds : int, default 5
+            Number of cross-fitting folds.
+        seed : int, default 0
+            Seed of the fold assignment.
+
+        Returns
+        -------
+        Model
+            The model (``self``) with ``calibration`` set.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted or the fit does not converge.
+        ValueError
+            If ``n_folds`` is less than 2.
+        """
+        if self.booster is None:
+            raise RuntimeError("Model.fit must be called before calibrate")
+        if n_folds < 2:
+            raise ValueError("n_folds must be at least 2")
+        fold = np.random.default_rng(seed).permutation(len(train)) % n_folds
+        cum_hazard = np.empty(len(train))
+        for k in range(n_folds):
+            held_out = fold == k
+            rows = train[held_out]
+            fold_model = Model(
+                self.kind, self.params, self.features, self.cat_features
+            ).fit(train[~held_out], valid)
+            cum_hazard[held_out] = fold_model._cum_hazard_at(
+                fold_model._predict_margin(rows),
+                rows["duration_h"].to_numpy()[:, None],
+            )[:, 0]
+        self.calibration = _fit_frailty_link(
+            cum_hazard, train["event"].to_numpy().astype(bool)
+        )
         return self
 
     def _predict_margin(self, data: pd.DataFrame) -> np.ndarray:
@@ -494,20 +623,30 @@ class Model:
         """
         return self._survival_at(self._predict_margin(data), times)
 
-    def _survival_at(self, margin: np.ndarray, times: np.ndarray) -> np.ndarray:
-        """``S(t | x)`` from margins; ``times`` is ``(m,)`` shared or ``(n, m)`` per row."""
+    def _cum_hazard_at(self, margin: np.ndarray, times: np.ndarray) -> np.ndarray:
+        """Cumulative hazard ``-log S(t | x)`` before ``calibration``.
+
+        ``times`` is ``(m,)`` shared or ``(n, m)`` per row.
+        """
         times = np.atleast_2d(np.asarray(times, dtype=float))
 
         if self.kind == "cox":
             ev_times, h0 = self._breslow
             idx = np.searchsorted(ev_times, times, side="right")
             cum_hazard = np.where(idx > 0, h0[np.maximum(idx - 1, 0)], 0.0)
-            return np.exp(-np.exp(margin)[:, None] * cum_hazard)
+            return np.exp(margin)[:, None] * cum_hazard
 
         sigma = self.params["aft_loss_distribution_scale"]
         with np.errstate(divide="ignore"):
             log_times = np.log(times)
-        return norm.sf((log_times - margin[:, None]) / sigma)
+        return -norm.logsf((log_times - margin[:, None]) / sigma)
+
+    def _survival_at(self, margin: np.ndarray, times: np.ndarray) -> np.ndarray:
+        """``S(t | x)`` from margins; ``times`` is ``(m,)`` shared or ``(n, m)`` per row."""
+        cum_hazard = self._cum_hazard_at(margin, times)
+        if self.calibration is not None:
+            cum_hazard, _ = _frailty_link(cum_hazard, **self.calibration)
+        return np.exp(-cum_hazard)
 
     def conditional_survival(
         self, data: pd.DataFrame, ages: np.ndarray, times: np.ndarray
@@ -561,7 +700,8 @@ class Model:
         AFT uses the exact log-normal hazard. The Breslow baseline is a step
         function, so for Cox its jumps are smoothed with an Epanechnikov kernel
         and scaled by ``exp(f(x))``; that estimate is biased downwards within
-        ``bandwidth`` of 0 and of the last training event time.
+        ``bandwidth`` of 0 and of the last training event time. With
+        ``calibration`` the hazard is multiplied by the slope of the link.
 
         Parameters
         ----------
@@ -591,18 +731,22 @@ class Model:
                 raise ValueError("bandwidth is required for the Cox hazard")
             ev_times, h0 = self._breslow
             baseline = _epanechnikov(times, ev_times, bandwidth) @ np.diff(h0, prepend=0.0)
-            return np.exp(margin)[:, None] * baseline[None, :]
-
-        sigma = self.params["aft_loss_distribution_scale"]
-        with np.errstate(divide="ignore"):
-            z = (np.log(times)[None, :] - margin[:, None]) / sigma
-        # pdf / sf in log space stays finite deep in the right tail.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return np.where(
-                times > 0,
-                np.exp(norm.logpdf(z) - norm.logsf(z)) / (sigma * times),
-                0.0,
-            )
+            hazard = np.exp(margin)[:, None] * baseline[None, :]
+        else:
+            sigma = self.params["aft_loss_distribution_scale"]
+            with np.errstate(divide="ignore"):
+                z = (np.log(times)[None, :] - margin[:, None]) / sigma
+            # pdf / sf in log space stays finite deep in the right tail.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                hazard = np.where(
+                    times > 0,
+                    np.exp(norm.logpdf(z) - norm.logsf(z)) / (sigma * times),
+                    0.0,
+                )
+        if self.calibration is None:
+            return hazard
+        _, slope = _frailty_link(self._cum_hazard_at(margin, times), **self.calibration)
+        return slope * hazard
 
     def save(self, path: str | Path) -> None:
         """Save the fitted model, including the state ``survival`` needs, as JSON.
@@ -632,6 +776,7 @@ class Model:
             "breslow": None
             if self._breslow is None
             else [arr.tolist() for arr in self._breslow],
+            "calibration": self.calibration,
             "booster": json.loads(self.booster.save_raw("json")),
         }
         Path(path).write_text(json.dumps(state))
@@ -659,6 +804,8 @@ class Model:
         if state["breslow"] is not None:
             ev_times, h0 = state["breslow"]
             model._breslow = (np.asarray(ev_times), np.asarray(h0))
+        # Files written before ``calibrate`` existed have no such key.
+        model.calibration = state.get("calibration")
         model.booster = xgb.Booster()
         model.booster.load_model(bytearray(json.dumps(state["booster"]).encode()))
         return model
@@ -678,37 +825,64 @@ LOWER_IS_BETTER = {
 }
 
 
+def evaluation_times(*splits: pd.DataFrame, n_times: int = 50) -> np.ndarray:
+    """Evaluation grid inside the follow-up range of every split.
+
+    ``sksurv`` needs the times inside the follow-up of the evaluated rows, and IPCW
+    weights grow without bound where few of them are still observed, so the grid
+    covers the part of the 5%-80% ``duration_h`` quantile range shared by all
+    ``splits``. Metrics computed on one grid are comparable across the splits.
+
+    Parameters
+    ----------
+    *splits : pd.DataFrame
+        Row sets with ``duration_h`` that will be evaluated on the grid.
+    n_times : int, default 50
+        Number of grid points.
+
+    Returns
+    -------
+    numpy.ndarray
+        Increasing times in flight hours, shape ``(n_times,)``.
+    """
+    bounds = np.array([np.quantile(d["duration_h"], [0.05, 0.8]) for d in splits])
+    return np.linspace(bounds[:, 0].max(), bounds[:, 1].min(), n_times)
+
+
 def _scalar_metrics(
-    y_train: np.ndarray,
+    y_reference: np.ndarray,
     y: np.ndarray,
     surv: np.ndarray,
     risk: np.ndarray,
     times: np.ndarray,
 ) -> dict[str, float]:
     """``SCALAR_METRICS`` from precomputed survival probabilities and risk scores."""
-    _, mean_auc = cumulative_dynamic_auc(y_train, y, 1 - surv, times)
+    _, mean_auc = cumulative_dynamic_auc(y_reference, y, 1 - surv, times)
     return {
         "c_index": concordance_index_censored(y["event"], y["time"], risk)[0],
-        "c_index_ipcw": concordance_index_ipcw(y_train, y, risk, tau=times[-1])[0],
+        "c_index_ipcw": concordance_index_ipcw(y_reference, y, risk, tau=times[-1])[0],
         "mean_auc": mean_auc,
-        "ibs": integrated_brier_score(y_train, y, surv, times),
+        "ibs": integrated_brier_score(y_reference, y, surv, times),
     }
 
 
 def evaluate(
-    model: Model, train: pd.DataFrame, data: pd.DataFrame, times: np.ndarray
+    model: Model, reference: pd.DataFrame, data: pd.DataFrame, times: np.ndarray
 ) -> dict[str, float | np.ndarray]:
     """Discrimination and calibration metrics of ``model`` on ``data``.
 
-    IPCW-based metrics estimate the censoring distribution on ``train`` with
+    IPCW-based metrics estimate the censoring distribution on ``reference`` with
     Kaplan-Meier, i.e. they assume censoring independent of the features.
 
     Parameters
     ----------
     model : Model
         Fitted model.
-    train : pd.DataFrame
-        Training rows, used only for the censoring distribution.
+    reference : pd.DataFrame
+        Rows used only for the censoring distribution. They must be censored
+        like ``data``. With a split by commissioning date newer drones are
+        censored earlier, so pass ``data`` itself: the training rows would
+        understate the weights and with them the Brier score.
     data : pd.DataFrame
         Rows to evaluate on.
     times : numpy.ndarray
@@ -722,12 +896,12 @@ def evaluate(
         ``times[-1]``), ``mean_auc`` and ``ibs``; per-time arrays ``brier``
         and ``auc`` aligned with ``times``.
     """
-    y_train, y = _surv(train), _surv(data)
+    y_reference, y = _surv(reference), _surv(data)
     surv = model.survival(data, times)
-    _, brier = brier_score(y_train, y, surv, times)
-    auc, _ = cumulative_dynamic_auc(y_train, y, 1 - surv, times)
+    _, brier = brier_score(y_reference, y, surv, times)
+    auc, _ = cumulative_dynamic_auc(y_reference, y, 1 - surv, times)
     return {
-        **_scalar_metrics(y_train, y, surv, model.risk(data), times),
+        **_scalar_metrics(y_reference, y, surv, model.risk(data), times),
         "brier": brier,
         "auc": auc,
     }
@@ -735,7 +909,7 @@ def evaluate(
 
 def bootstrap_compare(
     models: dict[str, Model],
-    train: pd.DataFrame,
+    reference: pd.DataFrame,
     data: pd.DataFrame,
     times: np.ndarray,
     n_boot: int = 1000,
@@ -746,14 +920,16 @@ def bootstrap_compare(
     Every replicate resamples rows of ``data`` with replacement and scores all
     models on the same rows, so metric differences account for the correlation
     between models. Models are fixed: the intervals reflect evaluation-set
-    sampling noise only, not refitting variability.
+    sampling noise only, not refitting variability. The censoring distribution
+    is estimated once on ``reference`` and kept fixed across replicates.
 
     Parameters
     ----------
     models : dict[str, Model]
         Fitted models keyed by name; every pair is compared.
-    train : pd.DataFrame
-        Training rows, used only for the IPCW censoring distribution.
+    reference : pd.DataFrame
+        Rows used only for the IPCW censoring distribution, as in ``evaluate``
+        (normally ``data`` itself).
     data : pd.DataFrame
         Evaluation rows (e.g. the test split).
     times : numpy.ndarray
@@ -775,13 +951,13 @@ def bootstrap_compare(
     samples : pd.DataFrame
         Bootstrap replicates, columns ``(model, metric)``.
     """
-    y_train, y = _surv(train), _surv(data)
+    y_reference, y = _surv(reference), _surv(data)
     preds = {
         name: (model.survival(data, times), model.risk(data))
         for name, model in models.items()
     }
     point = {
-        name: _scalar_metrics(y_train, y, surv, risk, times)
+        name: _scalar_metrics(y_reference, y, surv, risk, times)
         for name, (surv, risk) in preds.items()
     }
 
@@ -794,7 +970,7 @@ def bootstrap_compare(
                 (name, metric): value
                 for name, (surv, risk) in preds.items()
                 for metric, value in _scalar_metrics(
-                    y_train, y[idx], surv[idx], risk[idx], times
+                    y_reference, y[idx], surv[idx], risk[idx], times
                 ).items()
             }
         )
@@ -981,6 +1157,9 @@ def tune(
 ) -> Model:
     """Tune hyper-parameters with Optuna (TPE) on the validation integrated Brier score.
 
+    The score uses ``evaluation_times(valid)`` and the censoring distribution of
+    ``valid``, so it stays inside the validation follow-up.
+
     Parameters
     ----------
     kind : str
@@ -997,9 +1176,8 @@ def tune(
     Model
         Model refitted with the best parameters.
     """
-    y_train = _surv(train)
     y_valid = _surv(valid)
-    TIMES = np.quantile(train["duration_h"], np.linspace(0.1, 0.9, 9))
+    times = evaluation_times(valid)
 
     def objective(trial):
 
@@ -1018,19 +1196,19 @@ def tune(
             params["aft_loss_distribution_scale"] = trial.suggest_float(
                 "aft_loss_distribution_scale",
                 0.2,
-                1.2,
+                2.0,
                 log=True,
             )
 
         model = Model(kind, params, features, cat_features).fit(train, valid)
 
-        survival = model.survival(valid, TIMES)
+        survival = model.survival(valid, times)
 
         return integrated_brier_score(
-            y_train,
+            y_valid,
             y_valid,
             survival,
-            TIMES,
+            times,
         )
 
     study = optuna.create_study(

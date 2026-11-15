@@ -77,8 +77,8 @@ class Settings:
 
 
 def active(data: DashboardData) -> pd.DataFrame:
-    """Test drones still in service (censored)."""
-    return data.predictions[data.predictions["event"] == 0]
+    """Test drones in service at the data cut-off (censored and not left the fleet)."""
+    return data.predictions[data.predictions["in_service"]]
 
 
 def text_context(data: DashboardData, settings: Settings) -> dict:
@@ -96,6 +96,7 @@ def text_context(data: DashboardData, settings: Settings) -> dict:
         "n_features": len(settings.features),
         "n_test": len(data.predictions),
         "n_active": len(active(data)),
+        "n_censored": int((data.predictions["event"] == 0).sum()),
         "t_val": meta["split"]["t_val"],
         "t_test": meta["split"]["t_test"],
         "cat_features": ", ".join(
@@ -139,7 +140,7 @@ def kpis(data: DashboardData, settings: Settings) -> list[tuple[str, str, str, s
             "primary",
         ),
         ("Failures", f"{n_fail}", f"{n_fail / len(pred):.0%} of the fleet", "danger"),
-        ("In service", f"{len(act)}", "no failure at the data cut-off", "success"),
+        ("In service", f"{len(act)}", "flying at the data cut-off", "success"),
         (
             "High maintenance priority",
             f"{int((act['priority'] == PRIORITY_HIGH).sum())}",
@@ -163,8 +164,9 @@ def kpis(data: DashboardData, settings: Settings) -> list[tuple[str, str, str, s
 
 KPI_HELP = (
     '**How to read the cards.** "Failures": how many drones have already gone out '
-    'of service for a critical reason. "In service": drones without failure at the '
-    'data cut-off (censored observations). "High maintenance priority": drones that, '
+    'of service for a critical reason. "In service": drones still flying at the '
+    "data cut-off; drones that left the fleet earlier without a failure (sold, lost, "
+    'retired) are in neither group. "High maintenance priority": drones that, '
     "according to the model, will fail in the next {window:.0f} flight hours with "
     'probability ≥ {p_high:.0%}. "Median remaining life": how many more flight hours '
     "a typical working drone flies before its failure risk reaches 50%. C (C-index, "
@@ -221,7 +223,7 @@ def hyperparams_frame(models: dict[str, Model]) -> pd.DataFrame:
             value = (
                 model.booster.best_iteration
                 if key == "best_iteration"
-                else model.params.get(key)
+                else {**model.params, **(model.calibration or {})}.get(key)
             )
             present |= value is not None
             row[MODEL_LABELS[kind]] = "—" if value is None else f"{value:.4g}"
@@ -277,7 +279,7 @@ def segment_stats(
                 lambda g: insights.hours_text(insights.km_median(g))
             ),
             "Mean flight hours, h": groups["duration_h"].mean().round(0),
-            "In service": groups["event"].apply(lambda e: int((e == 0).sum())),
+            "In service": groups["in_service"].sum(),
             f"Mean P(failure in {window:.0f} h)": groups["p_fail_window"]
             .mean()
             .round(3),
@@ -294,9 +296,9 @@ def segment_findings(
         return [
             (
                 "Maintenance priority is defined by the forecast for **working** "
-                'drones, while "None (failed)" holds all drones that have already '
-                "failed. So the survival curves here differ by construction and **do "
-                "not compare reliability**."
+                'drones, while "None (failed)" and "None (left the fleet)" hold the '
+                "drones that are no longer in service. So the survival curves here "
+                "differ by construction and **do not compare reliability**."
             ),
             (
                 "Use this breakdown for the table below: how many drones are in each "
@@ -415,6 +417,8 @@ def drone_status(row: pd.Series) -> str:
     if row["event"] == 1:
         mode = FAILURE_MODE_LABELS.get(row["failure_mode"], row["failure_mode"])
         return f"failed ({mode}) at {row['duration_h']:.0f} h"
+    if not row["in_service"]:
+        return f"left the fleet without failure at {row['duration_h']:.0f} h"
     return f"in service, {row['duration_h']:.0f} h, priority: {row['priority']}"
 
 
@@ -502,7 +506,7 @@ def drone_findings(data: DashboardData, settings: Settings, drone_id: str) -> li
     )
     row = rows.iloc[0]
     age = float(row["duration_h"])
-    if row["event"] == 0 and settings.hazard_grid[0] <= age <= settings.hazard_grid[-1]:
+    if row["in_service"] and settings.hazard_grid[0] <= age <= settings.hazard_grid[-1]:
         at_age = np.array([age])
         rate = data.best_model.hazard(rows, at_age, settings.hazard_bandwidth)[0, 0]
         pred = data.predictions
@@ -520,9 +524,9 @@ def whatif_defaults(row: pd.Series, features: list[str]) -> list:
 
 
 def whatif_base(pred: pd.DataFrame, drone_id: str) -> pd.DataFrame:
-    """Drone rows for the what-if; failed drones restart from age 0."""
+    """Drone rows for the what-if; drones no longer in service restart from age 0."""
     rows = drone_rows(pred, drone_id).copy()
-    if rows["event"].iloc[0] == 1:
+    if not rows["in_service"].iloc[0]:
         rows["duration_h"] = 0.0
     return rows
 

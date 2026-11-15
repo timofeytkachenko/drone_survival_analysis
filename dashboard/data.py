@@ -27,6 +27,7 @@ TABLES = (
     "predictions",
     "survival_mean",
     "backtest",
+    "backtest_groups",
 )
 
 
@@ -86,8 +87,9 @@ def load(
     FileNotFoundError
         If any artifact or model file is missing.
     ValueError
-        If the predictions use priority labels other than ``PRIORITY_ORDER``
-        (artifacts written by an older notebook version).
+        If the predictions have no ``in_service`` column or use priority labels
+        other than ``PRIORITY_ORDER`` (artifacts written by an older notebook
+        version).
     """
     hint = "run drone_survival.ipynb end to end first"
     meta_path = artifacts_dir / "meta.json"
@@ -106,6 +108,10 @@ def load(
         )
 
     tables = {name: pd.read_parquet(path) for name, path in table_paths.items()}
+    if "in_service" not in tables["predictions"]:
+        raise ValueError(
+            "predictions.parquet has no in_service column; re-run drone_survival.ipynb"
+        )
     unknown = set(tables["predictions"]["priority"]) - set(PRIORITY_ORDER)
     if unknown:
         raise ValueError(

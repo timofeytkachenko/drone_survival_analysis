@@ -285,8 +285,10 @@ a day wears out three times faster than one flying 1 hour a day.
     (
         "2. Censoring: why a simple average does not work",
         """
-At the data cut-off {n_active} of {n_test} test drones have **not failed** yet. All
-we know about them is that they worked *at least* as long as their flight hours.
+For {n_censored} of {n_test} test drones no failure was observed: {n_active} are
+still flying at the data cut-off, the rest left the fleet earlier for a non-critical
+reason. All we know about them is that they worked *at least* as long as their flight
+hours.
 
 * If such drones are **discarded**, mostly the quickly broken ones remain, and
   remaining life is underestimated.
@@ -365,15 +367,24 @@ diverge, there is a reason to dig deeper.
   {n_trials} trials per model, each trains the model and scores it by
   **validation IBS**. Bayesian search (TPE) picks the next settings based on the
   previous results.
-* The tuned settings are in the table below.
+* After training, the models are **recalibrated for hidden differences between
+  drones**. Drones with identical features still differ in durability; the weaker
+  ones fail first, so the survivors of a high-risk group are sturdier than their
+  features suggest, and without a correction the model overstates their risk at
+  later ages. The correction is estimated on training drones the model did not see
+  while fitting (five-fold cross-fitting). It changes the probabilities, not the
+  order of drones. A model is corrected only if such differences are found.
+* The tuned settings and the two recalibration parameters are in the table below
+  ("—" means the model is used as trained).
 """,
     ),
     (
         "7. How quality is measured",
         """
 All metrics are computed on test drones at time points between the 5% and 80%
-quantiles of test flight hours (beyond that there are too few observations for a
-reliable estimate).
+quantiles of flight hours (beyond that there are too few observations for a
+reliable estimate). Validation uses the same time points, so the two sets can be
+compared.
 
 * **C-index (Harrell)**: the share of correctly ordered drone pairs.
 * **C-index (Uno, IPCW)**: the same, corrected for censoring; depends less on how
@@ -386,7 +397,9 @@ reliable estimate).
   each group the forecast is compared with the Kaplan-Meier observation.
 
 The IPCW correction estimates the probability of "leaving the observation" on the
-training set and reweights drones so censoring does not distort the metrics.
+evaluated set itself and reweights drones so censoring does not distort the metrics.
+Newer drones leave the observation earlier, so the training set would understate the
+weights.
 """,
     ),
     (
@@ -439,6 +452,10 @@ absolute values.
     (
         "11. Remaining life and maintenance priority",
         """
+A drone is **in service** if its flight log reaches the data cut-off: commissioning
+date plus flight hours divided by daily utilisation. Drones last seen earlier without
+a failure left the fleet and get no forecast.
+
 For a drone in service with a hours flown, the model builds a **conditional curve**
 $S(a+u)/S(a)$: the probability of operating u more hours *knowing* it has already
 survived the first a hours. From it:
@@ -470,6 +487,9 @@ of hours already flown.
 * Features are fixed at the data cut-off; the model does not track changes of
   operating conditions over time (that is what the "what if" scenario is for).
 * No forecast is made beyond the {horizon:.0f} h horizon.
+* Remaining-life forecasts are checked on the "Fleet" tab, on average and by risk
+  group. The recalibration removes most of the overstated risk of the riskiest
+  drones, not all of it: read the top of the high-priority list as a ranking first.
 * Conclusions about factors are correlational; for decisions that change
   procedures, confirm them with an experiment or an engineering analysis.
 * The models are retrained on every notebook run; the numbers on the dashboard
@@ -514,6 +534,18 @@ HYPERPARAMS = {
         ("Spread of the failure time around the AFT model forecast."),
     ),
     "best_iteration": ("Number of trees", "Best iteration by early stopping."),
+    "frailty_variance": (
+        "Hidden durability variance",
+        (
+            "Recalibration: spread of the unobserved durability between drones with the "
+            "same features. The larger it is, the more the risk of long-surviving risky "
+            "drones is lowered."
+        ),
+    ),
+    "scale": (
+        "Recalibration scale",
+        ("Recalibration: overall multiplier of the accumulated risk; 1 means no change."),
+    ),
 }
 
 WHATIF_HELP = (
@@ -522,8 +554,9 @@ WHATIF_HELP = (
     '"Recalculate". The model recomputes the remaining-life forecast from the current '
     "flight hours, a dashed line appears on the chart above, and a comparison with an "
     "explanation appears below. Numeric values are limited to the training range (the "
-    "model was not trained outside it). For a failed drone, remaining life is computed "
-    "from zero, as for a new drone with the same characteristics."
+    "model was not trained outside it). For a drone that failed or left the fleet, "
+    "remaining life is computed from zero, as for a new drone with the same "
+    "characteristics."
 )
 
 # Per-figure explanations: "what" (what is shown), "how" (how to read it),
@@ -782,10 +815,28 @@ FIGURES = {
         "how": "Take all test drones that operated without failure for at least "
         "L = {landmark:.0f} h and look at what happened to them next. The black curve "
         "is observed, the coloured ones are what the model predicted at time L. Close "
-        "curves mean the remaining-life forecasts in the table can be trusted.",
+        "curves mean the remaining-life forecasts are right on average across the "
+        "fleet.",
         "details": "Landmark analysis: observed is Kaplan-Meier on time $T - L$ for "
         "drones with $T > L$; forecast is the mean $S(L+u|x)/S(L|x)$ over the same "
         "drones. L is the first quartile of test flight hours.",
+    },
+    "backtest_groups": {
+        "what": "The same retrospective check split by predicted risk: does a forecast "
+        "of 30% mean that 30% fail?",
+        "how": "The drones still flying at L = {landmark:.0f} h are split into five "
+        "equal groups by the predicted probability of failing in the next "
+        "{window:.0f} h, the number behind the maintenance priority. Each point is a "
+        "group: horizontally the mean forecast, vertically the share that actually "
+        "failed, with its 95% interval for the {best} model. Points on the dotted "
+        "diagonal mean accurate probabilities; points below it mean the model "
+        "overstates the risk. The grey dashed line is {best} before the recalibration "
+        'for hidden differences between drones ("Methodology", step 6).',
+        "details": "Observed share = 1 − Kaplan-Meier survival at {window:.0f} h after "
+        "the landmark within the group, with a log-log interval. The groups are "
+        "quintiles of each model's own forecast, so the two models' groups hold "
+        "different drones. Each group is a fifth of the drones at risk, so the "
+        "interval is wide and gaps of a few pp are within noise.",
     },
     "drone_survival": {
         "what": "Probability that this drone operates without failure for more than t "
@@ -829,7 +880,8 @@ FIGURES = {
         "how": "X axis: additional flight hours; Y axis: the probability of operating "
         "them without failure. A dashed line above the solid one means the scenario "
         "extends remaining life.",
-        "details": "For a failed drone the flight hours are set to 0: the scenario "
+        "details": "For a drone that failed or left the fleet the flight hours are set "
+        "to 0: the scenario "
         'answers "what would the remaining life of a new drone with these '
         'characteristics be".',
     },
