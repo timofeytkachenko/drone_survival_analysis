@@ -6,20 +6,18 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from dashboard import insights, texts
+from dashboard import insights
 from dashboard.data import DashboardData
 from dashboard.labels import (
-    FAILURE_MODE_LABELS,
-    FEATURE_LABELS,
-    METRIC_LABELS,
-    MODEL_LABELS,
+    PRIORITY_FAILED,
     PRIORITY_HIGH,
+    PRIORITY_LEFT,
     PRIORITY_LOW,
     PRIORITY_MEDIUM,
     PRIORITY_ORDER,
     RISK_GROUP_ORDER,
-    SEGMENT_LABELS,
 )
+from dashboard.locale import bundle, tr
 from utils import (
     Model,
     hazard_bandwidth,
@@ -29,7 +27,15 @@ from utils import (
 )
 
 SEGMENT_ORDER = {"risk_group": RISK_GROUP_ORDER, "priority": PRIORITY_ORDER}
-SEGMENTS = {**SEGMENT_LABELS, "priority": "Maintenance priority"}
+# Levers a maintainer can change; everything else is fixed when the drone is commissioned.
+LEVERS = (
+    "maintenance_interval_h",
+    "operator_experience_yrs",
+    "daily_utilization_h",
+    "avg_flight_min",
+    "avg_payload_kg",
+    "payload_ratio",
+)
 PRIORITY_COLORS = {
     PRIORITY_HIGH: "#f8d7da",
     PRIORITY_MEDIUM: "#fff3cd",
@@ -81,9 +87,9 @@ def active(data: DashboardData) -> pd.DataFrame:
     return data.predictions[data.predictions["in_service"]]
 
 
-def text_context(data: DashboardData, settings: Settings) -> dict:
-    """Placeholders for the ``texts`` templates."""
-    meta = data.meta
+def text_context(data: DashboardData, settings: Settings, lang: str = "en") -> dict:
+    """Placeholders for the text templates."""
+    meta, labels = data.meta, bundle(lang)
     return {
         "window": settings.window,
         "horizon": settings.horizon,
@@ -100,16 +106,18 @@ def text_context(data: DashboardData, settings: Settings) -> dict:
         "t_val": meta["split"]["t_val"],
         "t_test": meta["split"]["t_test"],
         "cat_features": ", ".join(
-            FEATURE_LABELS[f].lower() for f in settings.cat_features
+            labels["feature_labels"][f].lower() for f in settings.cat_features
         ),
-        "best": MODEL_LABELS[settings.best],
+        "best": labels["model_labels"][settings.best],
         "generated_at": meta["generated_at"].replace("T", " "),
     }
 
 
-def fmt_hours(x: float, horizon: float) -> str:
-    """Remaining-life hours, ``> horizon`` when not reached."""
-    return f"> {horizon:.0f} h" if not np.isfinite(x) else f"{x:.0f} h"
+def fmt_hours(x: float, horizon: float, lang: str = "en") -> str:
+    """Remaining-life hours, beyond the horizon when the level is not reached."""
+    if not np.isfinite(x):
+        return tr(lang, "ui.above_horizon", horizon=horizon)
+    return tr(lang, "ui.hours_value", hours=x)
 
 
 def priority(p_fail: float, settings: Settings) -> str:
@@ -122,7 +130,7 @@ def priority(p_fail: float, settings: Settings) -> str:
 # --- Overview -----------------------------------------------------------------
 
 
-def kpis(data: DashboardData, settings: Settings) -> list[tuple[str, str, str, str]]:
+def kpis(data: DashboardData, settings: Settings, lang: str = "en") -> list[tuple[str, str, str, str]]:
     """``(title, value, subtitle, colour)`` of the overview cards."""
     pred, act = data.predictions, active(data)
     test_metrics = (
@@ -132,92 +140,122 @@ def kpis(data: DashboardData, settings: Settings) -> list[tuple[str, str, str, s
     )
     n_fail = int(pred["event"].sum())
     finite_rul = act.loc[np.isfinite(act["rul_median"]), "rul_median"]
+    model = bundle(lang)["model_labels"][settings.best]
     return [
         (
-            "Drones in the test set",
+            tr(lang, "ui.kpi_drones"),
             f"{len(pred)}",
-            f"commissioned from {data.meta['split']['t_test']}",
+            tr(lang, "ui.kpi_drones_sub", t_test=data.meta["split"]["t_test"]),
             "primary",
         ),
-        ("Failures", f"{n_fail}", f"{n_fail / len(pred):.0%} of the fleet", "danger"),
-        ("In service", f"{len(act)}", "flying at the data cut-off", "success"),
         (
-            "High maintenance priority",
+            tr(lang, "ui.kpi_failures"),
+            f"{n_fail}",
+            tr(lang, "ui.kpi_failures_sub", share=n_fail / len(pred)),
+            "danger",
+        ),
+        (tr(lang, "ui.kpi_in_service"), f"{len(act)}", tr(lang, "ui.kpi_in_service_sub"), "success"),
+        (
+            tr(lang, "ui.kpi_high"),
             f"{int((act['priority'] == PRIORITY_HIGH).sum())}",
-            f"P(failure in {settings.window:.0f} h) ≥ {settings.p_high:.0%}",
+            tr(lang, "ui.kpi_high_sub", window=settings.window, p_high=settings.p_high),
             "danger",
         ),
         (
-            "Median remaining life",
-            f"{finite_rul.median():.0f} h",
-            f"drones in service ({len(finite_rul)} with an estimate)",
+            tr(lang, "ui.kpi_expected", window=settings.window),
+            f"{act['p_fail_window'].sum():.0f}",
+            tr(lang, "ui.kpi_expected_sub"),
+            "danger",
+        ),
+        (
+            tr(lang, "ui.kpi_median"),
+            tr(lang, "ui.hours_value", hours=finite_rul.median()),
+            tr(lang, "ui.kpi_median_sub", n=len(finite_rul)),
             "info",
         ),
         (
-            f"{MODEL_LABELS[settings.best]} model",
+            tr(lang, "ui.kpi_model", model=model),
             f"C = {test_metrics['c_index_ipcw']:.3f}",
-            f"IBS = {test_metrics['ibs']:.3f} on test",
+            tr(lang, "ui.kpi_model_sub", ibs=test_metrics["ibs"]),
             "secondary",
         ),
     ]
 
 
-KPI_HELP = (
-    '**How to read the cards.** "Failures": how many drones have already gone out '
-    'of service for a critical reason. "In service": drones still flying at the '
-    "data cut-off; drones that left the fleet earlier without a failure (sold, lost, "
-    'retired) are in neither group. "High maintenance priority": drones that, '
-    "according to the model, will fail in the next {window:.0f} flight hours with "
-    'probability ≥ {p_high:.0%}. "Median remaining life": how many more flight hours '
-    "a typical working drone flies before its failure risk reaches 50%. C (C-index, "
-    "Uno): quality of ranking drones by risk (0.5 is random, 1 is perfect); IBS: "
-    "probability forecast error (0.25 is a 50/50 forecast, lower is better)."
-)
-
-
-def key_findings(data: DashboardData, settings: Settings) -> list[str]:
+def key_findings(data: DashboardData, settings: Settings, lang: str = "en") -> list[str]:
     """Headline conclusions for the overview tab."""
+    labels = bundle(lang)
     importance = data.tables["shap_importance"]
     top = importance[importance["model"] == settings.best].nlargest(3, "share")
     factors = ", ".join(
-        f'"{FEATURE_LABELS[f]}" ({s:.0%})' for f, s in zip(top["feature"], top["share"])
+        tr(lang, "phrases.findings_factor", label=labels["feature_labels"][f], share=s)
+        for f, s in zip(top["feature"], top["share"])
     )
     findings = [
-        (
-            f"The best model is {MODEL_LABELS[settings.best]} (lowest Integrated Brier "
-            "score on validation)."
-        ),
-        f"Main failure risk factors: {factors} of the total influence.",
+        tr(lang, "phrases.findings_best", name=labels["model_labels"][settings.best]),
+        tr(lang, "phrases.findings_factors", items=factors),
     ]
     summary = data.tables["bootstrap_summary"]
     for row in summary[summary["significant"]].itertuples():
         findings.append(
-            f"Bootstrap: {MODEL_LABELS[row.better]} is statistically better on "
-            f'"{METRIC_LABELS[row.metric]}" (p = {row.p_value:.3f}, without correction '
-            "for multiple comparisons)."
+            tr(
+                lang,
+                "phrases.findings_boot",
+                name=labels["model_labels"][row.better],
+                metric=labels["metric_labels"][row.metric],
+                p=row.p_value,
+            )
         )
     if not summary["significant"].any():
-        findings.append("Bootstrap: no significant difference between the models.")
+        findings.append(tr(lang, "phrases.findings_boot_none"))
     act = active(data)
-    n_high = int((act["priority"] == PRIORITY_HIGH).sum())
-    n_medium = int((act["priority"] == PRIORITY_MEDIUM).sum())
     findings.append(
-        f"Of {len(act)} drones in service, {n_high} will fail in the next "
-        f"{settings.window:.0f} h with probability ≥ {settings.p_high:.0%} and another "
-        f"{n_medium} with ≥ {settings.p_medium:.0%}: these are candidates for "
-        'unscheduled maintenance ("Fleet" tab).'
+        tr(
+            lang,
+            "phrases.findings_queue",
+            n=len(act),
+            high=int((act["priority"] == PRIORITY_HIGH).sum()),
+            medium=int((act["priority"] == PRIORITY_MEDIUM).sum()),
+            window=settings.window,
+            p_high=settings.p_high,
+            p_medium=settings.p_medium,
+            expected=act["p_fail_window"].sum(),
+        )
     )
     return findings
+
+
+def priority_sensitivity(
+    active_rows: pd.DataFrame, settings: Settings, lang: str = "en"
+) -> pd.DataFrame:
+    """Queue size at high-priority cutoffs 30/40/50%, medium cutoff unchanged."""
+    rows = []
+    probability = active_rows["p_fail_window"]
+    for high in (0.3, 0.4, 0.5):
+        rows.append(
+            {
+                tr(lang, "ui.col_threshold"): f"{high:.0%}",
+                tr(lang, "ui.col_high_count"): int((probability >= high).sum()),
+                tr(lang, "ui.col_medium_count"): int(
+                    ((probability >= settings.p_medium) & (probability < high)).sum()
+                ),
+                tr(lang, "ui.col_current"): (
+                    tr(lang, "ui.current_mark") if np.isclose(high, settings.p_high) else ""
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # --- Methodology --------------------------------------------------------------------
 
 
-def hyperparams_frame(models: dict[str, Model]) -> pd.DataFrame:
+def hyperparams_frame(models: dict[str, Model], lang: str = "en") -> pd.DataFrame:
     """Tuned hyper-parameters with plain-language meaning."""
+    labels = bundle(lang)
     rows = []
-    for key, (name, meaning) in texts.HYPERPARAMS.items():
-        row = {"Setting": name, "Meaning": meaning}
+    for key, (name, meaning) in labels["hyperparams"].items():
+        row = {tr(lang, "ui.setting"): name, tr(lang, "ui.meaning"): meaning}
         present = False
         for kind, model in models.items():
             value = (
@@ -226,35 +264,37 @@ def hyperparams_frame(models: dict[str, Model]) -> pd.DataFrame:
                 else {**model.params, **(model.calibration or {})}.get(key)
             )
             present |= value is not None
-            if value is None:
-                row[MODEL_LABELS[kind]] = "—"
-            else:
-                row[MODEL_LABELS[kind]] = (
-                    value if isinstance(value, str) else f"{value:.4g}"
-                )
+            row[labels["model_labels"][kind]] = (
+                "—"
+                if value is None
+                else value if isinstance(value, str) else f"{value:.4g}"
+            )
         if present:
             rows.append(row)
     return pd.DataFrame(rows)
 
 
-def features_frame(meta: dict) -> pd.DataFrame:
+def features_frame(meta: dict, lang: str = "en") -> pd.DataFrame:
     """Feature dictionary with training ranges."""
+    labels = bundle(lang)
     rows = []
-    for f in meta["features"]:
-        if f == "is_refurbished":
-            kind, values = "yes/no", "True / False"
-        elif f in meta["cat_features"]:
-            kind, values = "category", ", ".join(map(str, meta["categories"][f]))
+    for feature in meta["features"]:
+        if feature == "is_refurbished":
+            kind, values = tr(lang, "ui.kind_bool"), tr(lang, "ui.bool_values")
+        elif feature in meta["cat_features"]:
+            kind, values = tr(lang, "ui.kind_category"), ", ".join(
+                map(str, meta["categories"][feature])
+            )
         else:
-            low, high = meta["numeric_ranges"][f]
-            kind, values = "number", f"{low:.3g} – {high:.3g}"
+            low, high = meta["numeric_ranges"][feature]
+            kind, values = tr(lang, "ui.kind_number"), f"{low:.3g} – {high:.3g}"
         rows.append(
             {
-                "Feature": FEATURE_LABELS[f],
-                "Column": f,
-                "Description": texts.FEATURE_DESCRIPTIONS[f],
-                "Type": kind,
-                "Values in training": values,
+                tr(lang, "ui.feature"): labels["feature_labels"][feature],
+                tr(lang, "ui.column"): feature,
+                tr(lang, "ui.description"): labels["feature_descriptions"][feature],
+                tr(lang, "ui.type"): kind,
+                tr(lang, "ui.values_in_training"): values,
             }
         )
     return pd.DataFrame(rows)
@@ -270,48 +310,87 @@ def segment_levels(pred: pd.DataFrame, segment: str) -> list:
     return [lv for lv in order if lv in levels] if order else sorted(levels, key=str)
 
 
+def numeric_segment_features(data: DashboardData, settings: Settings) -> list[str]:
+    """Three numeric features with the largest SHAP share of the selected model."""
+    importance = data.tables["shap_importance"]
+    ranked = importance[importance["model"] == settings.best].sort_values(
+        "share", ascending=False
+    )
+    numeric = [feature for feature in ranked["feature"] if feature not in settings.cat_features]
+    return numeric[:3]
+
+
+def segment_options(data: DashboardData, settings: Settings, lang: str = "en") -> dict[str, str]:
+    """Segment key -> localized label, including quartile cuts of the top numeric features."""
+    labels = bundle(lang)
+    options = dict(labels["segment_labels"])
+    for feature in numeric_segment_features(data, settings):
+        options[f"q:{feature}"] = tr(
+            lang,
+            "ui.quantile_segment",
+            feature=labels["feature_labels"][feature],
+        )
+    return options
+
+
+def prepare_segment(pred: pd.DataFrame, segment: str) -> tuple[pd.DataFrame, str, list]:
+    """Frame, column and ordered levels for a segment, binning numeric ``q:`` keys."""
+    if not str(segment).startswith("q:"):
+        return pred, segment, segment_levels(pred, segment)
+    feature = segment[2:]
+    out = pred.copy()
+    bins = pd.qcut(out[feature], 4, duplicates="drop")
+    labels = [f"{iv.left:.3g}–{iv.right:.3g}" for iv in bins.cat.categories]
+    out["_bin"] = bins.map(dict(zip(bins.cat.categories, labels, strict=True)))
+    return out, "_bin", labels
+
+
 def segment_stats(
-    pred: pd.DataFrame, segment: str, levels: list, window: float
+    pred: pd.DataFrame,
+    segment: str,
+    levels: list,
+    window: float,
+    lang: str = "en",
+    axis_name: str = "",
 ) -> pd.DataFrame:
     """Per-level counts, Kaplan-Meier median and mean predicted failure probability."""
     groups = pred.groupby(segment, observed=True)
     stats = pd.DataFrame(
         {
-            "Drones": groups["drone_id"].count(),
-            "Failures": groups["event"].sum(),
-            "Failure share": groups["event"].mean().round(3),
-            "Median to failure, h": groups[["event", "duration_h"]].apply(
-                lambda g: insights.hours_text(insights.km_median(g))
+            tr(lang, "ui.col_drones"): groups["drone_id"].count(),
+            tr(lang, "ui.col_failures"): groups["event"].sum(),
+            tr(lang, "ui.col_failure_share"): groups["event"].mean().round(3),
+            tr(lang, "ui.col_median"): groups[["event", "duration_h"]].apply(
+                lambda g: insights.hours_text(insights.km_median(g), lang)
             ),
-            "Mean flight hours, h": groups["duration_h"].mean().round(0),
-            "In service": groups["in_service"].sum(),
-            f"Mean P(failure in {window:.0f} h)": groups["p_fail_window"]
-            .mean()
-            .round(3),
+            tr(lang, "ui.col_mean_hours"): groups["duration_h"].mean().round(0),
+            tr(lang, "ui.col_in_service"): groups["in_service"].sum(),
+            tr(lang, "ui.col_mean_p", window=window): groups["p_fail_window"].mean().round(3),
         }
     )
-    return stats.reindex(levels).rename_axis(SEGMENTS[segment]).reset_index()
+    stats = stats.reindex(levels)
+    source = segment if not segment.startswith("q:") else ""
+    if segment in ("priority", "risk_group"):
+        stats.index = [insights.level_text(lang, segment, lv) for lv in stats.index]
+    return stats.rename_axis(axis_name or source).reset_index()
 
 
 def segment_findings(
-    pred: pd.DataFrame, segment: str, levels: list, window: float
+    pred: pd.DataFrame, segment: str, levels: list, window: float, lang: str = "en"
 ) -> list[str]:
     """Takeaways for a segment; the priority split is defined by the outcome itself."""
     if segment == "priority":
+        labels = bundle(lang)["priority_labels"]
         return [
-            (
-                "Maintenance priority is defined by the forecast for **working** "
-                'drones, while "None (failed)" and "None (left the fleet)" hold the '
-                "drones that are no longer in service. So the survival curves here "
-                "differ by construction and **do not compare reliability**."
+            tr(
+                lang,
+                "phrases.priority_segment_1",
+                failed=labels[PRIORITY_FAILED],
+                left=labels[PRIORITY_LEFT],
             ),
-            (
-                "Use this breakdown for the table below: how many drones are in each "
-                "priority group, their mean flight hours and mean failure probability "
-                f"in {window:.0f} h."
-            ),
+            tr(lang, "phrases.priority_segment_2", window=window),
         ]
-    return insights.segments(pred, segment, levels)
+    return insights.segments(pred, segment, levels, lang)
 
 
 # --- Model quality ----------------------------------------------------------------
@@ -343,95 +422,153 @@ def hazard_table(data: DashboardData, settings: Settings) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def metrics_frame(metrics: pd.DataFrame) -> pd.DataFrame:
+def metrics_frame(metrics: pd.DataFrame, lang: str = "en") -> pd.DataFrame:
     """Metric table with readable labels."""
+    labels = bundle(lang)
     frame = metrics.copy()
-    frame["model"] = frame["model"].map(MODEL_LABELS)
+    frame["model"] = frame["model"].map(labels["model_labels"])
+    frame["split"] = frame["split"].map(
+        {"val": tr(lang, "ui.split_val"), "test": tr(lang, "ui.split_test")}
+    )
     return frame.rename(
-        columns={"model": "Model", "split": "Split", **METRIC_LABELS}
+        columns={
+            "model": tr(lang, "ui.col_model"),
+            "split": tr(lang, "ui.col_split"),
+            **labels["metric_labels"],
+        }
     ).round(4)
 
 
-def bootstrap_frame(summary: pd.DataFrame) -> pd.DataFrame:
+def bootstrap_frame(summary: pd.DataFrame, lang: str = "en") -> pd.DataFrame:
     """Bootstrap summary with readable labels."""
+    labels = bundle(lang)
     frame = summary.copy()
-    frame["metric"] = frame["metric"].map(METRIC_LABELS)
+    frame["metric"] = frame["metric"].map(labels["metric_labels"])
     for col in ("model_a", "model_b", "better"):
-        frame[col] = frame[col].map(MODEL_LABELS)
+        frame[col] = frame[col].map(labels["model_labels"])
     return frame.round(4)
 
 
 # --- Risk factors -------------------------------------------------------------------
 
 
-def beeswarm_findings(data: DashboardData, settings: Settings, kind: str) -> list[str]:
+def beeswarm_findings(
+    data: DashboardData, settings: Settings, kind: str, lang: str = "en"
+) -> list[str]:
     """Direction of effect for the three most important features of ``kind``."""
     shap_values, importance = data.tables["shap_values"], data.tables["shap_importance"]
+    labels = bundle(lang)["feature_labels"]
     top = importance[importance["model"] == kind].nlargest(3, "share")["feature"]
     return [
-        f'"{FEATURE_LABELS[f]}": '
-        + insights.shap_direction(shap_values, kind, f, f in settings.cat_features)[0]
-        for f in top
+        f'"{labels[feature]}": '
+        + insights.shap_direction(
+            shap_values, kind, feature, feature in settings.cat_features, lang
+        )[0]
+        for feature in top
     ]
 
 
 # --- Fleet --------------------------------------------------------------------------
 
 
-def fleet_columns(settings: Settings) -> dict[str, str]:
+def fleet_columns(settings: Settings, lang: str = "en") -> dict[str, str]:
     """Column -> header of the fleet table."""
     return {
-        "drone_id": "Drone",
-        "model": "Model",
-        "environment": "Environment",
-        "age_h": "Flight hours, h",
-        "p_fail_window": f"P(failure in {settings.window:.0f} h)",
-        "rul_q10": "Life until 10% risk, h",
-        "rul_median": "Median remaining life, h",
-        "rmrl": "Expected remaining life, h",
-        "risk_group": "Risk group",
-        "priority": "Maintenance priority",
+        "drone_id": tr(lang, "ui.fleet_drone"),
+        "model": tr(lang, "ui.fleet_model"),
+        "environment": tr(lang, "ui.fleet_environment"),
+        "age_h": tr(lang, "ui.fleet_age"),
+        "p_fail_window": tr(lang, "ui.fleet_p", window=settings.window),
+        "rul_q10": tr(lang, "ui.fleet_q10"),
+        "rul_median": tr(lang, "ui.fleet_median"),
+        "rmrl": tr(lang, "ui.fleet_rmrl"),
+        "main_factor": tr(lang, "ui.main_factor"),
+        "risk_group": tr(lang, "ui.fleet_risk"),
+        "priority": tr(lang, "ui.fleet_priority"),
     }
 
 
-def fleet_tooltips(settings: Settings) -> dict[str, str]:
+def fleet_tooltips(settings: Settings, lang: str = "en") -> dict[str, str]:
     """Column -> header tooltip of the fleet table."""
     return {
-        "age_h": "How many flight hours the drone has already worked without failure",
-        "p_fail_window": f"Probability of failure in the next {settings.window:.0f} flight hours",
-        "rul_q10": "After how many hours the failure probability reaches 10%",
-        "rul_median": "After how many hours the failure probability reaches 50%",
-        "rmrl": f"Mean remaining time within {settings.horizon:.0f} h",
-        "risk_group": "Third of the fleet by model risk score (regardless of flight hours)",
-        "priority": f"High: P ≥ {settings.p_high:.0%}, medium: P ≥ {settings.p_medium:.0%}",
+        "age_h": tr(lang, "ui.tip_age"),
+        "p_fail_window": tr(lang, "ui.tip_p", window=settings.window),
+        "rul_q10": tr(lang, "ui.tip_q10"),
+        "rul_median": tr(lang, "ui.tip_median"),
+        "rmrl": tr(lang, "ui.tip_rmrl", horizon=settings.horizon),
+        "risk_group": tr(lang, "ui.tip_risk"),
+        "priority": tr(
+            lang, "ui.tip_priority", p_high=settings.p_high, p_medium=settings.p_medium
+        ),
     }
 
 
-def fleet_frame(data: DashboardData, settings: Settings) -> pd.DataFrame:
+def main_factor_labels(data: DashboardData, lang: str = "en") -> pd.Series:
+    """drone_id -> feature that raises the selected model's risk the most."""
+    shap = data.tables["shap_values"]
+    part = shap[(shap["model"] == data.best_name) & (shap["shap"] > 0)]
+    if part.empty:
+        return pd.Series(dtype=str)
+    top = part.loc[part.groupby("drone_id")["shap"].idxmax()]
+    labels = bundle(lang)["feature_labels"]
+    return pd.Series(
+        [
+            tr(lang, "phrases.main_factor_value", label=labels[feature], value=value)
+            for feature, value in zip(top["feature"], top["display"])
+        ],
+        index=top["drone_id"].to_numpy(),
+    )
+
+
+def fleet_frame(data: DashboardData, settings: Settings, lang: str = "en") -> pd.DataFrame:
     """Drones in service, riskiest first; ``inf`` remaining life becomes NaN."""
-    columns = list(fleet_columns(settings))
-    frame = active(data).sort_values("p_fail_window", ascending=False)[columns]
-    return frame.replace([np.inf, -np.inf], np.nan).reset_index(drop=True)
+    columns = [col for col in fleet_columns(settings, lang) if col != "main_factor"]
+    frame = active(data).sort_values("p_fail_window", ascending=False)
+    frame = frame[columns].copy()
+    labels = main_factor_labels(data, lang)
+    frame["main_factor"] = frame["drone_id"].map(labels).fillna(tr(lang, "ui.no_factor"))
+    ordered = list(fleet_columns(settings, lang))
+    return frame[ordered].replace([np.inf, -np.inf], np.nan).reset_index(drop=True)
+
+
+def disagreeing_drones(
+    data: DashboardData, settings: Settings, n: int = 5
+) -> pd.DataFrame:
+    """Test drones with the largest |S_cox - S_aft| at the maintenance window."""
+    pred = data.predictions
+    at = np.array([float(settings.window)])
+    gap = np.abs(
+        data.models["cox"].survival(pred, at)[:, 0]
+        - data.models["aft"].survival(pred, at)[:, 0]
+    )
+    return pred.iloc[np.argsort(-gap)[:n]]
 
 
 # --- Drone card ---------------------------------------------------------------------
 
 
-def drone_status(row: pd.Series) -> str:
+def drone_status(row: pd.Series, lang: str = "en") -> str:
     """One-line status of a drone."""
     if row["event"] == 1:
-        mode = FAILURE_MODE_LABELS.get(row["failure_mode"], row["failure_mode"])
-        return f"failed ({mode}) at {row['duration_h']:.0f} h"
+        mode = bundle(lang)["failure_mode_labels"].get(
+            row["failure_mode"], row["failure_mode"]
+        )
+        return tr(lang, "phrases.status_failed", mode=mode, hours=row["duration_h"])
     if not row["in_service"]:
-        return f"left the fleet without failure at {row['duration_h']:.0f} h"
-    return f"in service, {row['duration_h']:.0f} h, priority: {row['priority']}"
+        return tr(lang, "phrases.status_left", hours=row["duration_h"])
+    return tr(
+        lang,
+        "phrases.status_active",
+        hours=row["duration_h"],
+        priority=bundle(lang)["priority_labels"].get(row["priority"], row["priority"]),
+    )
 
 
-def drone_options(pred: pd.DataFrame) -> dict[str, str]:
+def drone_options(pred: pd.DataFrame, lang: str = "en") -> dict[str, str]:
     """drone_id -> label; drones in service first, riskiest first."""
     ordered = pred.sort_values(["event", "p_fail_window"], ascending=[True, False])
     return {
-        row["drone_id"]: f"{row['drone_id']} · {row['model']} · {drone_status(row)}"
+        row["drone_id"]: f"{row['drone_id']} · {row['model']} · {drone_status(row, lang)}"
         for _, row in ordered.iterrows()
     }
 
@@ -441,38 +578,41 @@ def drone_rows(pred: pd.DataFrame, drone_id: str) -> pd.DataFrame:
     return pred[pred["drone_id"] == drone_id]
 
 
-def drone_metrics(row: pd.Series, settings: Settings) -> list[tuple[str, str, str]]:
+def drone_metrics(
+    row: pd.Series, settings: Settings, lang: str = "en"
+) -> list[tuple[str, str, str]]:
     """``(name, value, hint)`` remaining-life summary of a drone in service."""
     return [
         (
-            f"P(failure in {settings.window:.0f} h)",
+            tr(lang, "ui.fleet_p", window=settings.window),
             f"{row['p_fail_window']:.1%}",
-            "probability of failure in the next flight hours",
+            tr(lang, "ui.p_fail_hint"),
         ),
         (
-            "Life until 10% risk",
-            fmt_hours(row["rul_q10"], settings.horizon),
-            "conservative deadline for scheduled maintenance",
+            tr(lang, "ui.fleet_q10"),
+            fmt_hours(row["rul_q10"], settings.horizon, lang),
+            tr(lang, "ui.life_10_hint"),
         ),
         (
-            "Median remaining life",
-            fmt_hours(row["rul_median"], settings.horizon),
-            "the drone works longer with 50% probability",
+            tr(lang, "ui.fleet_median"),
+            fmt_hours(row["rul_median"], settings.horizon, lang),
+            tr(lang, "ui.median_life_hint"),
         ),
         (
-            "Expected remaining life",
-            f"{row['rmrl']:.0f} h",
-            f"mean within {settings.horizon:.0f} h",
+            tr(lang, "ui.fleet_rmrl"),
+            tr(lang, "ui.expected_life_value", hours=row["rmrl"]),
+            tr(lang, "ui.expected_life_hint", horizon=settings.horizon),
         ),
     ]
 
 
-def drone_features(row: pd.Series, features: list[str]) -> pd.DataFrame:
+def drone_features(row: pd.Series, features: list[str], lang: str = "en") -> pd.DataFrame:
     """Feature values of a drone with readable names."""
+    labels = bundle(lang)["feature_labels"]
     return pd.DataFrame(
         {
-            "Feature": [FEATURE_LABELS[f] for f in features],
-            "Value": [str(row[f]) for f in features],
+            tr(lang, "ui.feature"): [labels[f] for f in features],
+            tr(lang, "ui.value"): [str(row[f]) for f in features],
         }
     )
 
@@ -495,7 +635,9 @@ def drone_hazard_grid(settings: Settings, age: float) -> np.ndarray:
     return np.linspace(settings.hazard_bandwidth, end, 300)
 
 
-def drone_findings(data: DashboardData, settings: Settings, drone_id: str) -> list[str]:
+def drone_findings(
+    data: DashboardData, settings: Settings, drone_id: str, lang: str = "en"
+) -> list[str]:
     """Narrative explanation of one drone."""
     rows = drone_rows(data.predictions, drone_id)
     curve = data.best_model.survival(rows, settings.surv_grid)[0]
@@ -508,6 +650,7 @@ def drone_findings(data: DashboardData, settings: Settings, drone_id: str) -> li
         settings.best,
         settings.window,
         predicted_median,
+        lang,
     )
     row = rows.iloc[0]
     age = float(row["duration_h"])
@@ -518,7 +661,7 @@ def drone_findings(data: DashboardData, settings: Settings, drone_id: str) -> li
         fleet_rate = observed_hazard(
             pred["duration_h"], pred["event"], at_age, settings.hazard_bandwidth
         )[0][0]
-        findings.append(insights.drone_hazard(age, rate, fleet_rate, settings.best))
+        findings.append(insights.drone_hazard(age, rate, fleet_rate, settings.best, lang))
     return findings
 
 
@@ -562,31 +705,42 @@ def whatif_changes(
     return changes
 
 
+def whatif_order(features: list[str]) -> list[str]:
+    """Editable features: operational levers first, then characteristics fixed at entry."""
+    levers = [feature for feature in LEVERS if feature in features]
+    return [*levers, *[feature for feature in features if feature not in levers]]
+
+
 def whatif_compare(
-    model: Model, rows: pd.DataFrame, scenario: pd.DataFrame, settings: Settings
+    model: Model,
+    rows: pd.DataFrame,
+    scenario: pd.DataFrame,
+    settings: Settings,
+    lang: str = "en",
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
     """Remaining-life summaries of current and scenario conditions and a comparison table."""
     base = remaining_life(model, rows, settings.horizon, settings.window).iloc[0]
     new = remaining_life(model, scenario, settings.horizon, settings.window).iloc[0]
+    labels = bundle(lang)["priority_labels"]
     table = pd.DataFrame(
         {
             "": [
-                f"P(failure in {settings.window:.0f} h)",
-                "Maintenance priority",
-                "Median remaining life",
-                "Expected remaining life",
+                tr(lang, "ui.fleet_p", window=settings.window),
+                tr(lang, "ui.fleet_priority"),
+                tr(lang, "ui.fleet_median"),
+                tr(lang, "ui.fleet_rmrl"),
             ],
-            "Now": [
+            tr(lang, "ui.now"): [
                 f"{base['p_fail_window']:.1%}",
-                priority(base["p_fail_window"], settings),
-                fmt_hours(base["rul_median"], settings.horizon),
-                f"{base['rmrl']:.0f} h",
+                labels[priority(base["p_fail_window"], settings)],
+                fmt_hours(base["rul_median"], settings.horizon, lang),
+                tr(lang, "ui.expected_life_value", hours=base["rmrl"]),
             ],
-            "Scenario": [
+            tr(lang, "ui.scenario_col"): [
                 f"{new['p_fail_window']:.1%}",
-                priority(new["p_fail_window"], settings),
-                fmt_hours(new["rul_median"], settings.horizon),
-                f"{new['rmrl']:.0f} h",
+                labels[priority(new["p_fail_window"], settings)],
+                fmt_hours(new["rul_median"], settings.horizon, lang),
+                tr(lang, "ui.expected_life_value", hours=new["rmrl"]),
             ],
         }
     )
@@ -600,7 +754,7 @@ MAX_UPLOAD_ROWS = 10_000
 _BOOL_VALUES = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
 
 
-def read_csv_bytes(content: bytes) -> pd.DataFrame:
+def read_csv_bytes(content: bytes, lang: str = "en") -> pd.DataFrame:
     """Parse an uploaded CSV file.
 
     Parameters
@@ -621,9 +775,9 @@ def read_csv_bytes(content: bytes) -> pd.DataFrame:
     try:
         return pd.read_csv(io.BytesIO(content))
     except pd.errors.EmptyDataError as exc:
-        raise ValueError("The file is empty.") from exc
+        raise ValueError(tr(lang, "phrases.empty_file")) from exc
     except (pd.errors.ParserError, UnicodeDecodeError) as exc:
-        raise ValueError(f"The file could not be read as CSV: {exc}") from exc
+        raise ValueError(tr(lang, "phrases.bad_csv", error=exc)) from exc
 
 
 def upload_template(data: DashboardData, n: int = 5) -> pd.DataFrame:
@@ -650,7 +804,7 @@ def _risk_group(risk: np.ndarray, reference: pd.Series) -> np.ndarray:
 
 
 def score_upload(
-    raw: pd.DataFrame, data: DashboardData, settings: Settings
+    raw: pd.DataFrame, data: DashboardData, settings: Settings, lang: str = "en"
 ) -> tuple[pd.DataFrame, list[str]]:
     """Validate an uploaded table of drones and forecast them with the best model.
 
@@ -681,14 +835,12 @@ def score_upload(
         values cannot be interpreted.
     """
     if raw.empty:
-        raise ValueError("The file has no rows.")
+        raise ValueError(tr(lang, "phrases.no_rows"))
     if len(raw) > MAX_UPLOAD_ROWS:
-        raise ValueError(
-            f"The file has {len(raw):,} rows; at most {MAX_UPLOAD_ROWS:,} are supported."
-        )
+        raise ValueError(tr(lang, "phrases.too_many", n=len(raw), limit=MAX_UPLOAD_ROWS))
     missing = [f for f in settings.features if f not in raw.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {', '.join(missing)}.")
+        raise ValueError(tr(lang, "phrases.missing_columns", columns=", ".join(missing)))
 
     frame = raw.copy()
     if ID_COLUMN not in frame.columns:
@@ -704,21 +856,25 @@ def score_upload(
         values = pd.to_numeric(frame[col], errors="coerce")
         bad = values.isna() & frame[col].notna()
         if bad.any():
-            errors.append(f"{col}: non-numeric values in {int(bad.sum())} rows")
+            errors.append(tr(lang, "phrases.non_numeric", column=col, n=int(bad.sum())))
         frame[col] = values
     for col in (c for c in settings.cat_features if c not in categories):
         values = _to_bool(frame[col])
         bad = values.isna()
         if bad.any():
-            errors.append(f"{col}: expected True/False in {int(bad.sum())} rows")
+            errors.append(tr(lang, "phrases.expected_bool", column=col, n=int(bad.sum())))
         else:
             frame[col] = values.astype(bool)
     if (frame[AGE_COLUMN] < 0).any():
-        errors.append(f"{AGE_COLUMN}: negative values in {int((frame[AGE_COLUMN] < 0).sum())} rows")
+        errors.append(
+            tr(lang, "phrases.negative_age", column=AGE_COLUMN, n=int((frame[AGE_COLUMN] < 0).sum()))
+        )
     if frame[AGE_COLUMN].isna().any():
-        errors.append(f"{AGE_COLUMN}: empty values in {int(frame[AGE_COLUMN].isna().sum())} rows")
+        errors.append(
+            tr(lang, "phrases.empty_age", column=AGE_COLUMN, n=int(frame[AGE_COLUMN].isna().sum()))
+        )
     if errors:
-        raise ValueError("Invalid values: " + "; ".join(errors) + ".")
+        raise ValueError(tr(lang, "phrases.invalid_values", details="; ".join(errors)))
 
     warnings = []
     for col, levels in categories.items():
@@ -727,29 +883,37 @@ def score_upload(
         if unknown.any():
             seen = ", ".join(map(str, sorted(values[unknown].astype(str).unique())))
             warnings.append(
-                f"{FEATURE_LABELS[col]}: {int(unknown.sum())} rows with values not seen "
-                f"in training ({seen}); treated as missing."
+                tr(
+                    lang,
+                    "phrases.unknown_category",
+                    label=bundle(lang)["feature_labels"][col],
+                    n=int(unknown.sum()),
+                    seen=seen,
+                )
             )
     n_missing = int(frame[settings.features].isna().any(axis=1).sum())
     if n_missing:
-        warnings.append(
-            f"{n_missing} rows have empty feature values; the model treats them as missing."
-        )
+        warnings.append(tr(lang, "phrases.empty_features", n=n_missing))
     out_of_range = pd.Series(False, index=frame.index)
     for col, (low, high) in data.meta["numeric_ranges"].items():
         outside = (frame[col] < low) | (frame[col] > high)
         if outside.any():
             out_of_range |= outside
             warnings.append(
-                f"{FEATURE_LABELS[col]}: {int(outside.sum())} rows outside the training "
-                f"range {low:.3g} – {high:.3g}."
+                tr(
+                    lang,
+                    "phrases.outside_training",
+                    label=bundle(lang)["feature_labels"][col],
+                    n=int(outside.sum()),
+                    low=low,
+                    high=high,
+                )
             )
     max_age = active(data)["duration_h"].max()
     too_old = frame[AGE_COLUMN] > max_age
     if too_old.any():
         warnings.append(
-            f"{int(too_old.sum())} drones have {AGE_COLUMN} above {max_age:.0f} h (the "
-            "oldest drone in the test fleet); their remaining-life forecast is optimistic."
+            tr(lang, "phrases.too_old", n=int(too_old.sum()), column=AGE_COLUMN, max_age=max_age)
         )
 
     model = data.best_model
@@ -770,28 +934,30 @@ def score_upload(
     return scored.sort_values("p_fail_window", ascending=False, ignore_index=True), warnings
 
 
-def score_columns(settings: Settings) -> dict[str, str]:
+def score_columns(settings: Settings, lang: str = "en") -> dict[str, str]:
     """Column -> header of the scoring results table."""
-    return {**fleet_columns(settings), "out_of_range": "Outside training range"}
+    columns = {k: v for k, v in fleet_columns(settings, lang).items() if k != "main_factor"}
+    return {**columns, "out_of_range": tr(lang, "ui.fleet_outside")}
 
 
-def score_summary(scored: pd.DataFrame, settings: Settings) -> list[str]:
+def score_summary(scored: pd.DataFrame, settings: Settings, lang: str = "en") -> list[str]:
     """Headline numbers of a scored upload."""
     counts = scored["priority"].value_counts()
     return [
-        (
-            f"{len(scored)} drones scored: high maintenance priority "
-            f"**{counts.get(PRIORITY_HIGH, 0)}**, medium **{counts.get(PRIORITY_MEDIUM, 0)}**, "
-            f"low {counts.get(PRIORITY_LOW, 0)}."
+        tr(
+            lang,
+            "phrases.score_counts",
+            n=len(scored),
+            high=int(counts.get(PRIORITY_HIGH, 0)),
+            medium=int(counts.get(PRIORITY_MEDIUM, 0)),
+            low=int(counts.get(PRIORITY_LOW, 0)),
         ),
-        (
-            f"Mean P(failure in {settings.window:.0f} h) is "
-            f"**{scored['p_fail_window'].mean():.1%}**; expected number of failures in "
-            f"this group over the next {settings.window:.0f} flight hours: "
-            f"**≈ {scored['p_fail_window'].sum():.1f}**."
+        tr(
+            lang,
+            "phrases.score_expected",
+            window=settings.window,
+            mean=scored["p_fail_window"].mean(),
+            total=scored["p_fail_window"].sum(),
         ),
-        (
-            f"{int(scored['out_of_range'].sum())} drones have values outside the training "
-            "range; treat their forecast with caution."
-        ),
+        tr(lang, "phrases.score_outside", n=int(scored["out_of_range"].sum())),
     ]

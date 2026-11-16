@@ -18,20 +18,20 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dashboard import common, figures, insights, texts
+from dashboard import common, figures, insights
 from dashboard.data import DashboardData, load
-from dashboard.labels import FEATURE_LABELS, MODEL_LABELS
+from dashboard.locale import bundle, tr
 
-TABS = {
-    "overview": "Overview",
-    "method": "Methodology",
-    "segments": "Failure segments",
-    "quality": "Model quality",
-    "factors": "Risk factors",
-    "fleet": "Fleet",
-    "drone": "Drone card",
-    "score": "Score new drones",
-}
+TAB_KEYS = [
+    "overview",
+    "method",
+    "segments",
+    "quality",
+    "factors",
+    "fleet",
+    "drone",
+    "score",
+]
 CARD_COLORS = {
     "primary": "blue",
     "danger": "red",
@@ -40,42 +40,32 @@ CARD_COLORS = {
     "secondary": "gray",
 }
 PLOT_CONFIG = {"displaylogo": False}
-USAGE = "**How to use it.**"
-# The shared fleet intro describes the Dash table controls.
-INTRO_USAGE = {
-    "fleet": f"{USAGE} Sort by clicking a column header; search and filters are above "
-    "the table; hover over a header for the column explanation. Tick a drone's "
-    "checkbox on the left and its card with an explanation of the forecast opens.",
-}
+LANG = "en"
 
 
 @st.cache_resource(show_spinner="Loading artifacts and models…")
-def _load() -> tuple[DashboardData, common.Settings, dict, pd.DataFrame]:
+def _load() -> tuple[DashboardData, common.Settings, pd.DataFrame, pd.DataFrame]:
     data = load()
     settings = common.Settings.from_data(data)
     return (
         data,
         settings,
-        common.text_context(data, settings),
         common.hazard_table(data, settings),
+        common.disagreeing_drones(data, settings),
     )
 
 
 st.set_page_config(page_title="Drone failures", layout="wide")
-DATA, SETTINGS, TEXT_CONTEXT, HAZARD = _load()
+DATA, SETTINGS, HAZARD, DISAGREE = _load()
 PRED, TABLES, MODELS, META = DATA.predictions, DATA.tables, DATA.models, DATA.meta
 BEST = SETTINGS.best
 
 
-# --- Building blocks ----------------------------------------------------------------
-
-
 def _fmt(text: str) -> str:
-    return text.format(**TEXT_CONTEXT)
+    return text.format(**common.text_context(DATA, SETTINGS, LANG))
 
 
 def _plot(fig) -> None:
-    # The figure builders set their own colours for a light background.
     st.plotly_chart(fig, width="stretch", config=PLOT_CONFIG, theme=None)
 
 
@@ -84,26 +74,31 @@ def _table(frame: pd.DataFrame, **kwargs) -> None:
 
 
 def _findings(items: list[str]) -> None:
-    st.info("**What the data shows**\n\n" + "\n".join(f"- {s}" for s in items))
+    st.info("\n".join(f"- {item}" for item in items), title=tr(LANG, "ui.what_data_shows"))
 
 
 def _explain(key: str, findings: list[str] | None = None) -> None:
     """Explanation card for a figure: what, how to read, findings, method details."""
-    text = texts.FIGURES[key]
+    text = bundle(LANG)["figures"][key]
     with st.container(border=True):
         st.markdown(
-            _fmt(f"**What is shown.** {text['what']}\n\n**How to read it.** {text['how']}")
+            _fmt(
+                f"**{tr(LANG, 'ui.what_shown')}** {text['what']}\n\n"
+                f"**{tr(LANG, 'ui.how_to_read')}** {text['how']}"
+            )
         )
         if findings:
             _findings(findings)
-        with st.expander("More about the method"):
+        with st.expander(tr(LANG, "ui.more_method")):
             st.markdown(_fmt(text["details"]))
 
 
 def _intro(key: str) -> None:
-    text = texts.TAB_INTROS[key]
-    if key in INTRO_USAGE:
-        text = text.split(USAGE)[0] + INTRO_USAGE[key]
+    text = (
+        tr(LANG, "ui.fleet_streamlit")
+        if key == "fleet"
+        else bundle(LANG)["tab_intros"][key]
+    )
     with st.container(border=True):
         st.markdown(_fmt(text))
 
@@ -120,193 +115,193 @@ def _kept(name: str, default) -> dict:
     return {"key": name, "on_change": _save, "args": (name,)}
 
 
-# --- Tabs -----------------------------------------------------------------------------
-
-
 def overview_tab() -> None:
     _intro("overview")
-    cards = st.columns(3)
-    for k, (title, value, subtitle, color) in enumerate(common.kpis(DATA, SETTINGS)):
-        with cards[k % 3].container(border=True):
+    cards = st.columns(4)
+    for k, (title, value, subtitle, color) in enumerate(common.kpis(DATA, SETTINGS, LANG)):
+        with cards[k % 4].container(border=True):
             st.caption(title)
             st.markdown(f"### :{CARD_COLORS[color]}[{value}]")
             st.caption(subtitle)
-    st.caption(_fmt(common.KPI_HELP))
+    st.caption(_fmt(tr(LANG, "ui.priority_table", p_medium=SETTINGS.p_medium)))
+    _table(common.priority_sensitivity(common.active(DATA), SETTINGS, LANG))
     with st.container(border=True):
         st.markdown(
-            "##### Key findings\n\n"
-            + "\n".join(f"- {f}" for f in common.key_findings(DATA, SETTINGS))
+            f"##### {tr(LANG, 'ui.key_findings')}\n\n"
+            + "\n".join(f"- {item}" for item in common.key_findings(DATA, SETTINGS, LANG))
         )
-    overview = insights.overview(PRED)
-    left, right = st.columns([7, 5])
+    overview = insights.overview(PRED, LANG)
+    left, right = st.columns(2)
     with left:
-        _plot(figures.km_overall(PRED))
+        _plot(figures.km_overall(PRED, LANG))
         _explain("km_overall", overview[:2])
     with right:
-        _plot(figures.failure_modes(PRED))
-        _explain("failure_modes", overview[2:])
-    left, _ = st.columns([7, 5])
+        _plot(figures.hazard(HAZARD, [BEST], LANG))
+        _explain("hazard_overview", insights.hazard_trend(HAZARD, LANG))
+    left, right = st.columns(2)
     with left:
-        _plot(figures.hazard(HAZARD, with_models=False))
-        _explain("hazard_observed", insights.hazard_trend(HAZARD))
+        _plot(figures.failure_modes(PRED, LANG))
+        _explain("failure_modes", overview[2:])
+    with right:
+        _plot(figures.failure_mode_timing(PRED, LANG))
+        _explain("failure_timing")
 
 
 def method_tab() -> None:
+    catalog = bundle(LANG)
     _intro("method")
-    st.subheader("Analysis steps")
-    for title, body in texts.METHOD_STEPS:
+    st.subheader(tr(LANG, "ui.analysis_steps"))
+    for title, body in catalog["method_steps"]:
         with st.expander(title, expanded=True):
             st.markdown(_fmt(body))
-    st.subheader("Tuned model settings")
-    st.caption(
-        _fmt(
-            "Result of automatic tuning (step 6). Values were chosen by the lowest "
-            "validation IBS out of {n_trials} trials per model."
-        )
-    )
-    _table(common.hyperparams_frame(MODELS))
-    st.subheader("Feature dictionary")
-    st.caption(
-        "What the model knows about each drone. The range is the values in the "
-        "training set: outside it the forecast is less reliable, so \"what if\" "
-        "scenarios are limited to it. Use the column names in uploaded CSV files."
-    )
-    _table(common.features_frame(META))
-    st.subheader("Glossary")
+    st.subheader(tr(LANG, "ui.tuned_settings"))
+    st.caption(_fmt(tr(LANG, "ui.tuned_caption", n_trials=META["n_trials"])))
+    _table(common.hyperparams_frame(MODELS, LANG))
+    st.subheader(tr(LANG, "ui.feature_dictionary"))
+    st.caption(tr(LANG, "ui.feature_dictionary_caption"))
+    _table(common.features_frame(META, LANG))
+    st.subheader(tr(LANG, "ui.glossary"))
     _table(
-        pd.DataFrame(texts.GLOSSARY, columns=["Term", "Definition"]),
+        pd.DataFrame(
+            catalog["glossary"],
+            columns=[tr(LANG, "ui.term"), tr(LANG, "ui.definition")],
+        ),
         column_config={
-            "Term": st.column_config.TextColumn(width="small"),
-            "Definition": st.column_config.TextColumn(width="large"),
+            tr(LANG, "ui.term"): st.column_config.TextColumn(width="small"),
+            tr(LANG, "ui.definition"): st.column_config.TextColumn(width="large"),
         },
     )
 
 
 def segments_tab() -> None:
     _intro("segments")
+    options = common.segment_options(DATA, SETTINGS, LANG)
     segment = st.selectbox(
-        "Breakdown",
-        list(common.SEGMENTS),
-        format_func=common.SEGMENTS.get,
+        tr(LANG, "ui.breakdown"),
+        list(options),
+        format_func=options.get,
         **_kept("segment", "environment"),
     )
-    order = common.SEGMENT_ORDER.get(segment)
-    levels = common.segment_levels(PRED, segment)
-    _findings(common.segment_findings(PRED, segment, levels, SETTINGS.window))
+    frame, column, levels = common.prepare_segment(PRED, segment)
+    _findings(common.segment_findings(frame, column, levels, SETTINGS.window, LANG))
     left, right = st.columns(2)
     with left:
-        _plot(figures.segment_km(PRED, segment, order))
+        _plot(figures.segment_km(frame, column, levels, LANG, segment))
         _explain("segment_km")
     with right:
-        _plot(figures.segment_failure_structure(PRED, segment, order))
+        _plot(figures.segment_failure_structure(frame, column, levels, LANG, segment))
         _explain("segment_structure")
-    st.subheader("Statistics by segment")
-    _table(common.segment_stats(PRED, segment, levels, SETTINGS.window))
+    st.subheader(tr(LANG, "ui.statistics_by_segment"))
+    _table(
+        common.segment_stats(
+            frame, column, levels, SETTINGS.window, LANG, options[segment]
+        )
+    )
     _explain("segment_table")
 
 
 def quality_tab() -> None:
     brier_auc, metric_table = TABLES["brier_auc"], TABLES["metrics"]
     _intro("quality")
-    st.subheader("Step 1. Quality metrics")
-    _table(common.metrics_frame(metric_table))
-    _explain("metrics", insights.metrics(metric_table, BEST))
+    st.subheader(tr(LANG, "ui.step_metrics"))
+    _table(common.metrics_frame(metric_table, LANG))
+    _explain("metrics", insights.metrics(metric_table, BEST, LANG))
 
-    st.subheader("Step 2. How the models trained")
-    _plot(figures.learning_curves(MODELS))
-    _explain("learning_curves", insights.learning(MODELS))
+    st.subheader(tr(LANG, "ui.step_training"))
+    _plot(figures.learning_curves(MODELS, LANG))
+    _explain("learning_curves", insights.learning(MODELS, LANG))
 
-    st.subheader("Step 3. Predicted vs observed")
+    st.subheader(tr(LANG, "ui.step_predicted"))
     left, right = st.columns(2)
     with left:
-        _plot(figures.survival_mean(TABLES["survival_mean"]))
+        _plot(figures.survival_mean(TABLES["survival_mean"], LANG))
         _explain(
             "survival_mean",
             insights.mean_vs_km(
-                TABLES["survival_mean"], META["eval_times"]["test"][-1]
+                TABLES["survival_mean"], META["eval_times"]["test"][-1], LANG
             ),
         )
     with right:
-        sample = PRED.sample(5, random_state=0)
-        _plot(figures.individual_curves(MODELS, sample, SETTINGS.surv_grid))
+        _plot(figures.individual_curves(MODELS, DISAGREE, SETTINGS.surv_grid, LANG))
         _explain("individual_curves")
     left, right = st.columns(2)
     with left:
-        _plot(figures.hazard(HAZARD, with_models=True))
+        _plot(figures.hazard(HAZARD, list(MODELS), LANG))
     with right:
-        _explain("hazard_mean", insights.hazard_fit(HAZARD))
+        _explain("hazard_mean", insights.hazard_fit(HAZARD, LANG))
 
-    st.subheader("Step 4. Accuracy and discrimination over time")
+    st.subheader(tr(LANG, "ui.step_accuracy"))
     left, right = st.columns(2)
     with left:
-        _plot(figures.brier_curve(brier_auc, metric_table))
-        _explain("brier", insights.brier(brier_auc))
+        _plot(figures.brier_curve(brier_auc, metric_table, LANG))
+        _explain("brier", insights.brier(brier_auc, LANG))
     with right:
-        _plot(figures.auc_curve(brier_auc, metric_table))
-        _explain("auc", insights.auc(brier_auc))
+        _plot(figures.auc_curve(brier_auc, metric_table, LANG))
+        _explain("auc", insights.auc(brier_auc, LANG))
 
-    st.subheader("Step 5. Calibration")
+    st.subheader(tr(LANG, "ui.step_calibration"))
     horizons = META["calibration_horizons"]
     left, right = st.columns(2)
     with left:
         horizon = st.selectbox(
-            "Calibration horizon",
+            tr(LANG, "ui.calibration_horizon"),
             horizons,
-            format_func=lambda h: f"{h:.0f} h",
+            format_func=lambda hours: tr(LANG, "ui.horizon_hours", h=hours),
             **_kept("calibration_horizon", horizons[0]),
         )
-        _plot(figures.calibration(TABLES["calibration"], horizon))
+        _plot(figures.calibration(TABLES["calibration"], horizon, LANG))
     with right:
-        _explain("calibration", insights.calibration(TABLES["calibration"], horizon))
+        _explain(
+            "calibration", insights.calibration(TABLES["calibration"], horizon, LANG)
+        )
 
-    st.subheader("Step 6. Statistical model comparison (bootstrap)")
-    _table(common.bootstrap_frame(TABLES["bootstrap_summary"]))
+    st.subheader(tr(LANG, "ui.step_bootstrap"))
+    _table(common.bootstrap_frame(TABLES["bootstrap_summary"], LANG))
     _explain("bootstrap_table")
-    _plot(figures.bootstrap(TABLES["bootstrap_samples"], TABLES["bootstrap_summary"]))
-    _explain("bootstrap", insights.bootstrap(TABLES["bootstrap_summary"]))
+    _plot(figures.bootstrap(TABLES["bootstrap_samples"], TABLES["bootstrap_summary"], LANG))
+    _explain("bootstrap", insights.bootstrap(TABLES["bootstrap_summary"], LANG))
 
 
 def factors_tab() -> None:
     importance, shap_values = TABLES["shap_importance"], TABLES["shap_values"]
+    labels = bundle(LANG)
     top_feature = (
         importance[importance["model"] == BEST].nlargest(1, "share")["feature"].iloc[0]
     )
     _intro("factors")
     left, right = st.columns([5, 7])
     with left:
-        st.subheader("Step 1. Which factors matter most")
-        _plot(figures.shap_importance(importance, BEST))
-        _explain("shap_importance", insights.shap_top(importance, BEST))
+        st.subheader(tr(LANG, "ui.step_importance"))
+        _plot(figures.shap_importance(importance, BEST, LANG))
+        _explain("shap_importance", insights.shap_top(importance, BEST, lang=LANG))
     with right:
-        st.subheader("Step 2. Which way each factor acts")
+        st.subheader(tr(LANG, "ui.step_direction"))
         kind = st.radio(
-            "Model",
+            tr(LANG, "ui.model"),
             list(MODELS),
-            format_func=MODEL_LABELS.get,
+            format_func=labels["model_labels"].get,
             horizontal=True,
             **_kept("shap_model", BEST),
         )
-        _plot(figures.shap_beeswarm(shap_values, importance, kind))
-        _explain("shap_beeswarm", common.beeswarm_findings(DATA, SETTINGS, kind))
+        _plot(figures.shap_beeswarm(shap_values, importance, kind, LANG))
+        _explain("shap_beeswarm", common.beeswarm_findings(DATA, SETTINGS, kind, LANG))
 
-    st.subheader("Step 3. How exactly risk depends on a factor")
+    st.subheader(tr(LANG, "ui.step_dependence"))
     feature = st.selectbox(
-        "Feature",
+        tr(LANG, "ui.feature"),
         SETTINGS.features,
-        format_func=FEATURE_LABELS.get,
+        format_func=labels["feature_labels"].get,
         **_kept("shap_feature", top_feature),
     )
-    st.caption(texts.FEATURE_DESCRIPTIONS[feature])
+    st.caption(labels["feature_descriptions"][feature])
     categorical = feature in SETTINGS.cat_features
     left, right = st.columns([7, 5])
     with left:
-        _plot(
-            figures.shap_dependence(shap_values, kind, feature, categorical=categorical)
-        )
+        _plot(figures.shap_dependence(shap_values, kind, feature, categorical, LANG))
     with right:
         _explain(
             "shap_dependence",
-            insights.shap_direction(shap_values, kind, feature, categorical),
+            insights.shap_direction(shap_values, kind, feature, categorical, LANG),
         )
 
 
@@ -315,19 +310,21 @@ def _open_drone() -> None:
     rows = st.session_state["fleet"].selection.rows
     if rows:
         st.session_state["_drone"] = st.session_state["fleet_ids"][rows[0]]
-        st.session_state["tab"] = TABS["drone"]
+        st.session_state["tab_id"] = "drone"
+        st.session_state["tab"] = tr(LANG, "ui.tabs.drone")
 
 
 def _fleet_table() -> None:
-    frame = common.fleet_frame(DATA, SETTINGS)
+    frame = common.fleet_frame(DATA, SETTINGS, LANG)
+    headers = common.fleet_columns(SETTINGS, LANG)
     filters = st.columns([2, 3, 3, 3])
-    query = filters[0].text_input("Search by drone", **_kept("fleet_query", ""))
+    query = filters[0].text_input(tr(LANG, "ui.search_drone"), **_kept("fleet_query", ""))
     for col, column in zip(filters[1:], ("priority", "environment", "model")):
         levels = sorted(frame[column].dropna().unique().tolist(), key=str)
         chosen = col.multiselect(
-            common.fleet_columns(SETTINGS)[column],
+            headers[column],
             levels,
-            placeholder="all",
+            placeholder=tr(LANG, "ui.all"),
             **_kept(f"fleet_{column}", []),
         )
         if chosen:
@@ -336,15 +333,20 @@ def _fleet_table() -> None:
         frame = frame[frame["drone_id"].str.contains(query, case=False, regex=False)]
     frame = frame.reset_index(drop=True)
     st.session_state["fleet_ids"] = frame["drone_id"].tolist()
-    st.caption(
-        f"Drones shown: {len(frame)}. Select a row to open the drone card."
+    st.caption(tr(LANG, "ui.drones_shown", n=len(frame)))
+    st.download_button(
+        tr(LANG, "ui.download_fleet"),
+        frame.to_csv(index=False),
+        file_name="fleet.csv",
+        mime="text/csv",
+        on_click="ignore",
     )
     st.dataframe(
         _priority_style(frame),
         hide_index=True,
         width="stretch",
         height=560,
-        column_config=_forecast_config(common.fleet_columns(SETTINGS)),
+        column_config=_forecast_config(headers),
         key="fleet",
         on_select=_open_drone,
         selection_mode="single-row",
@@ -353,7 +355,7 @@ def _fleet_table() -> None:
 
 def _forecast_config(names: dict[str, str]) -> dict:
     """Column headers, tooltips and number formats of a forecast table."""
-    tooltips = common.fleet_tooltips(SETTINGS)
+    tooltips = common.fleet_tooltips(SETTINGS, LANG)
     formats = {
         "age_h": "%.0f",
         "p_fail_window": "%.3f",
@@ -375,11 +377,11 @@ def _forecast_config(names: dict[str, str]) -> dict:
 
 
 def _priority_style(frame: pd.DataFrame):
-    """Row background by maintenance priority."""
+    """Row background by the stored maintenance-priority code."""
     return frame.style.apply(
-        lambda r: (
-            [f"background-color: {common.PRIORITY_COLORS.get(r['priority'], '')}"]
-            * len(r)
+        lambda row: (
+            [f"background-color: {common.PRIORITY_COLORS.get(row['priority'], '')}"]
+            * len(row)
         ),
         axis=1,
     )
@@ -389,14 +391,16 @@ def fleet_tab() -> None:
     active = common.active(DATA)
     riskiest = active.nlargest(8, "p_fail_window")
     _intro("fleet")
-    _findings(insights.fleet(active, SETTINGS.window, SETTINGS.horizon))
-    st.subheader("Step 1. Drones in service")
+    _findings(insights.fleet(active, SETTINGS.window, SETTINGS.horizon, LANG))
+    st.subheader(tr(LANG, "ui.step_fleet"))
     _fleet_table()
     _explain("fleet_table")
-    st.subheader("Step 2. How much life is left")
+    _plot(figures.age_risk(active, SETTINGS.window, LANG))
+    _explain("age_risk")
+    st.subheader(tr(LANG, "ui.step_life"))
     left, right = st.columns(2)
     with left:
-        _plot(figures.rul_histogram(active, SETTINGS.horizon))
+        _plot(figures.rul_histogram(active, SETTINGS.horizon, LANG))
         _explain("rul_hist")
     with right:
         _plot(
@@ -406,24 +410,27 @@ def fleet_tab() -> None:
                 riskiest["duration_h"].to_numpy(),
                 SETTINGS.rul_grid,
                 riskiest["drone_id"].tolist(),
-                "Remaining life of the riskiest drones",
+                tr(LANG, "ui.riskiest_title"),
+                lang=LANG,
             )
         )
         _explain("riskiest")
-    st.subheader("Step 3. Can the remaining-life forecast be trusted")
+    st.subheader(tr(LANG, "ui.step_trust"))
     left, right = st.columns(2)
     with left:
-        _plot(figures.backtest(TABLES["backtest"], META["landmark"]))
-        _explain("backtest", insights.backtest(TABLES["backtest"], META["landmark"]))
+        _plot(figures.backtest(TABLES["backtest"], META["landmark"], LANG))
+        _explain(
+            "backtest", insights.backtest(TABLES["backtest"], META["landmark"], LANG)
+        )
     with right:
         _plot(
             figures.backtest_groups(
-                TABLES["backtest_groups"], BEST, SETTINGS.window, META["landmark"]
+                TABLES["backtest_groups"], BEST, SETTINGS.window, META["landmark"], LANG
             )
         )
         _explain(
             "backtest_groups",
-            insights.backtest_groups(TABLES["backtest_groups"], BEST),
+            insights.backtest_groups(TABLES["backtest_groups"], BEST, LANG),
         )
 
 
@@ -431,73 +438,75 @@ def _whatif_key(drone_id: str, feature: str) -> str:
     return f"whatif-{drone_id}-{feature}"
 
 
-def _run_whatif(drone_id: str) -> None:
+def _run_whatif(drone_id: str, order: list[str]) -> None:
     """Store the submitted scenario so the figure above the form can use it."""
     st.session_state["whatif"] = {
         "drone": drone_id,
-        "values": [
-            st.session_state[_whatif_key(drone_id, f)] for f in SETTINGS.features
-        ],
+        "values": [st.session_state[_whatif_key(drone_id, feature)] for feature in order],
     }
 
 
-def _whatif_form(drone_id: str, current: list, scenario: list | None) -> None:
-    values = scenario or current
-    with st.form(f"whatif-form-{drone_id}"):
-        cols = st.columns(4)
-        for k, (feature, value) in enumerate(zip(SETTINGS.features, values)):
-            col, key, label = (
-                cols[k % 4],
-                _whatif_key(drone_id, feature),
-                FEATURE_LABELS[feature],
+def _whatif_fields(drone_id: str, features: list[str], values: list) -> None:
+    labels = bundle(LANG)["feature_labels"]
+    yes_no = {"True": tr(LANG, "ui.yes"), "False": tr(LANG, "ui.no")}
+    cols = st.columns(4)
+    for k, (feature, value) in enumerate(zip(features, values)):
+        col, key, label = cols[k % 4], _whatif_key(drone_id, feature), labels[feature]
+        if feature == "is_refurbished":
+            col.selectbox(
+                label,
+                ["True", "False"],
+                index=["True", "False"].index(value),
+                format_func=yes_no.get,
+                key=key,
             )
-            if feature == "is_refurbished":
-                col.selectbox(
-                    label,
-                    ["True", "False"],
-                    index=["True", "False"].index(value),
-                    format_func={"True": "Yes", "False": "No"}.get,
-                    key=key,
-                )
-            elif feature in SETTINGS.cat_features:
-                options = META["categories"][feature]
-                col.selectbox(
-                    label,
-                    options,
-                    index=options.index(value) if value in options else 0,
-                    format_func=str,
-                    key=key,
-                )
-            else:
-                low, high = META["numeric_ranges"][feature]
-                col.number_input(
-                    label,
-                    value=value,
-                    key=key,
-                    help=f"Training range: {low:.3g} – {high:.3g}",
-                )
+        elif feature in SETTINGS.cat_features:
+            options = META["categories"][feature]
+            col.selectbox(
+                label,
+                options,
+                index=options.index(value) if value in options else 0,
+                format_func=str,
+                key=key,
+            )
+        else:
+            low, high = META["numeric_ranges"][feature]
+            shown = float(np.clip(float(value), low, high))
+            col.number_input(
+                label,
+                min_value=float(low),
+                max_value=float(high),
+                value=shown,
+                key=key,
+                help=tr(LANG, "ui.training_range", low=low, high=high),
+            )
+
+
+def _whatif_form(drone_id: str, order: list[str], current: list, scenario: list | None) -> None:
+    values = scenario or current
+    levers = [feature for feature in order if feature in common.LEVERS]
+    fixed = [feature for feature in order if feature not in common.LEVERS]
+    lever_values = values[: len(levers)]
+    fixed_values = values[len(levers) :]
+    with st.form(f"whatif-form-{drone_id}"):
+        st.markdown(f"**{tr(LANG, 'ui.whatif_levers')}**")
+        _whatif_fields(drone_id, levers, lever_values)
+        st.markdown(f"**{tr(LANG, 'ui.whatif_fixed')}**")
+        _whatif_fields(drone_id, fixed, fixed_values)
         st.form_submit_button(
-            "Recalculate", type="primary", on_click=_run_whatif, args=(drone_id,)
+            tr(LANG, "ui.recalculate"),
+            type="primary",
+            on_click=_run_whatif,
+            args=(drone_id, order),
         )
 
 
-def _out_of_range(changes: list[tuple[str, object, object]]) -> list[str]:
-    """Edited numeric features whose new value is outside the training range."""
-    bad = []
-    for feature, _old, new in changes:
-        if feature in SETTINGS.cat_features:
-            continue
-        low, high = META["numeric_ranges"][feature]
-        if new is None or not low <= float(new) <= high:
-            bad.append(f'"{FEATURE_LABELS[feature]}" ({low:.3g} – {high:.3g})')
-    return bad
-
-
 def drone_tab() -> None:
+    labels = bundle(LANG)
     _intro("drone")
-    options = common.drone_options(PRED)
+    options = common.drone_options(PRED, LANG)
     drone_id = st.selectbox(
-        "Drone",
+        tr(LANG, "ui.drone"),
         list(options),
         format_func=options.get,
         **_kept("drone", next(iter(options))),
@@ -505,24 +514,30 @@ def drone_tab() -> None:
     rows = common.drone_rows(PRED, drone_id)
     row = rows.iloc[0]
     failed = bool(row["event"])
-    _findings(common.drone_findings(DATA, SETTINGS, drone_id))
+    _findings(common.drone_findings(DATA, SETTINGS, drone_id, LANG))
 
     left, right = st.columns([4, 8])
     with left:
-        st.markdown(f"#### {drone_id}\n\n**{common.drone_status(row)}**")
+        st.markdown(f"#### {drone_id}\n\n**{common.drone_status(row, LANG)}**")
         if row["in_service"]:
             st.table(
                 pd.DataFrame(
-                    common.drone_metrics(row, SETTINGS),
-                    columns=["Measure", "Value", "Explanation"],
-                ).set_index("Measure")
+                    common.drone_metrics(row, SETTINGS, LANG),
+                    columns=[
+                        tr(LANG, "ui.measure"),
+                        tr(LANG, "ui.value"),
+                        tr(LANG, "ui.explanation"),
+                    ],
+                ).set_index(tr(LANG, "ui.measure"))
             )
-        st.markdown(f"Risk group: {row['risk_group']}")
-        st.table(common.drone_features(row, SETTINGS.features).set_index("Feature"))
+        group = labels["priority_labels"].get(row["risk_group"], row["risk_group"])
+        st.markdown(tr(LANG, "ui.risk_group_line", group=group))
+        features = common.drone_features(row, SETTINGS.features, LANG)
+        st.table(features.set_index(tr(LANG, "ui.feature")))
     with right:
         _plot(
             figures.drone_survival(
-                MODELS, rows, SETTINGS.surv_grid, row["duration_h"], failed
+                MODELS, rows, SETTINGS.surv_grid, row["duration_h"], failed, LANG
             )
         )
         _explain("drone_survival")
@@ -534,104 +549,108 @@ def drone_tab() -> None:
                 SETTINGS.hazard_bandwidth,
                 row["duration_h"],
                 failed,
+                LANG,
             )
         )
         _explain("drone_hazard")
 
-    current = common.whatif_defaults(row, SETTINGS.features)
+    order = common.whatif_order(SETTINGS.features)
+    current = common.whatif_defaults(row, order)
     stored = st.session_state.get("whatif")
-    scenario_values = (
-        stored["values"] if stored and stored["drone"] == drone_id else None
-    )
+    scenario_values = stored["values"] if stored and stored["drone"] == drone_id else None
     changes = (
-        common.whatif_changes(
-            row, SETTINGS.features, SETTINGS.cat_features, scenario_values
-        )
+        common.whatif_changes(row, order, SETTINGS.cat_features, scenario_values)
         if scenario_values
         else []
     )
-    invalid = _out_of_range(changes)
-
     base_rows = common.whatif_base(PRED, drone_id)
     age = base_rows["duration_h"].to_numpy()
     model = DATA.best_model
-    title = f"Remaining life from {age[0]:.0f} flight hours ({MODEL_LABELS[BEST]})"
+    title = tr(
+        LANG, "ui.remaining_life_title", age=age[0], model=labels["model_labels"][BEST]
+    )
+    names = [tr(LANG, "ui.current_conditions"), tr(LANG, "ui.scenario")]
     left, right = st.columns(2)
     with left:
         _plot(
             figures.shap_waterfall(
-                common.drone_contrib(DATA, drone_id), META["shap_base"][BEST], BEST
+                common.drone_contrib(DATA, drone_id),
+                META["shap_base"][BEST],
+                BEST,
+                lang=LANG,
             )
         )
         _explain("drone_shap")
     with right:
-        if scenario_values and not invalid:
-            scenario = common.whatif_scenario(
-                base_rows, SETTINGS.features, scenario_values
-            )
+        if scenario_values:
+            scenario = common.whatif_scenario(base_rows, order, scenario_values)
             fig = figures.conditional_curves(
                 model,
                 pd.concat([base_rows, scenario], ignore_index=True),
                 np.r_[age, age],
                 SETTINGS.rul_grid,
-                ["Current conditions", "Scenario"],
+                names,
                 title,
                 dashes=["solid", "dash"],
+                lang=LANG,
             )
         else:
+            scenario = None
             fig = figures.conditional_curves(
-                model, base_rows, age, SETTINGS.rul_grid, ["Current conditions"], title
+                model,
+                base_rows,
+                age,
+                SETTINGS.rul_grid,
+                names[:1],
+                title,
+                lang=LANG,
             )
         _plot(fig)
         _explain("drone_whatif")
 
-    st.subheader('"What if" scenario')
-    st.caption(texts.WHATIF_HELP)
-    _whatif_form(drone_id, current, scenario_values)
-    if invalid:
-        st.warning(
-            "Values outside the training range: " + ", ".join(invalid) + "."
-        )
-    elif scenario_values:
-        base, new, table = common.whatif_compare(model, base_rows, scenario, SETTINGS)
+    st.subheader(tr(LANG, "ui.whatif_title"))
+    st.caption(bundle(LANG)["whatif_help"])
+    _whatif_form(drone_id, order, current, scenario_values)
+    if scenario_values and scenario is not None:
+        base, new, table = common.whatif_compare(model, base_rows, scenario, SETTINGS, LANG)
         st.table(table.set_index(""))
-        _findings(insights.whatif(base, new, changes, SETTINGS.window))
+        _findings(insights.whatif(base, new, changes, SETTINGS.window, LANG))
 
 
 def score_tab() -> None:
     _intro("score")
-    st.subheader("Step 1. Prepare the file")
+    st.subheader(tr(LANG, "ui.prepare_file"))
     st.download_button(
-        "Download template",
+        tr(LANG, "ui.download_template"),
         common.upload_template(DATA).to_csv(index=False),
         file_name="drone_template.csv",
         mime="text/csv",
         on_click="ignore",
     )
-    st.subheader("Step 2. Upload it")
-    upload = st.file_uploader("CSV file with one row per drone", type="csv", key="score_file")
+    st.subheader(tr(LANG, "ui.upload"))
+    upload = st.file_uploader(tr(LANG, "ui.csv_file"), type="csv", key="score_file")
     if upload is None:
         return
     try:
         scored, warnings = common.score_upload(
-            common.read_csv_bytes(upload.getvalue()), DATA, SETTINGS
+            common.read_csv_bytes(upload.getvalue(), LANG), DATA, SETTINGS, LANG
         )
     except ValueError as exc:
         st.error(f"{upload.name}: {exc}")
         return
-    _findings(common.score_summary(scored, SETTINGS))
+    _findings(common.score_summary(scored, SETTINGS, LANG))
     if warnings:
-        st.warning("**Data warnings**\n\n" + "\n".join(f"- {w}" for w in warnings))
+        st.warning("\n".join(f"- {item}" for item in warnings), title=tr(LANG, "ui.data_warnings"))
 
-    st.subheader("Step 3. Review and download the forecast")
-    columns = common.score_columns(SETTINGS)
+    st.subheader(tr(LANG, "ui.review_download"))
+    columns = common.score_columns(SETTINGS, LANG)
     _table(
         _priority_style(scored[list(columns)]),
         height=min(560, 38 + 35 * len(scored)),
         column_config=_forecast_config(columns),
     )
     st.download_button(
-        "Download results (CSV)",
+        tr(LANG, "ui.download_results"),
         scored.to_csv(index=False),
         file_name="drone_forecasts.csv",
         mime="text/csv",
@@ -639,9 +658,6 @@ def score_tab() -> None:
         on_click="ignore",
     )
     _explain("score_table")
-
-
-# --- App ----------------------------------------------------------------------------
 
 
 RENDERERS = {
@@ -655,10 +671,26 @@ RENDERERS = {
     "score": score_tab,
 }
 
-st.title("Drone failure analysis: test set")
+st.session_state.setdefault("lang", "en")
+st.session_state.setdefault("tab_id", "overview")
+with st.sidebar:
+    st.radio(
+        tr(st.session_state["lang"], "ui.language"),
+        ["en", "ru"],
+        format_func=lambda code: "English" if code == "en" else "Русский",
+        key="lang",
+    )
+LANG = st.session_state["lang"]
+tab_labels = [tr(LANG, f"ui.tabs.{key}") for key in TAB_KEYS]
+if st.session_state.get("tab") not in tab_labels:
+    st.session_state["tab"] = tr(LANG, f"ui.tabs.{st.session_state['tab_id']}")
+
+st.title(tr(LANG, "ui.brand"))
+st.caption(_fmt(tr(LANG, "ui.generated")))
 for key, container in zip(
-    TABS, st.tabs(list(TABS.values()), key="tab", on_change="rerun")
+    TAB_KEYS, st.tabs(tab_labels, key="tab", on_change="rerun")
 ):
     if container.open:
+        st.session_state["tab_id"] = key
         with container:
             RENDERERS[key]()

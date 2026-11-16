@@ -6,14 +6,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sksurv.nonparametric import kaplan_meier_estimator
 
-from dashboard.labels import (
-    FAILURE_MODE_LABELS,
-    FEATURE_LABELS,
-    HAZARD_SCALE,
-    HAZARD_UNIT,
-    METRIC_LABELS,
-    MODEL_LABELS,
-)
+from dashboard.insights import level_text
+from dashboard.labels import HAZARD_SCALE
+from dashboard.locale import bundle, tr
 from utils import Model
 
 MODEL_COLORS = {"cox": "#1f77b4", "aft": "#ff7f0e"}
@@ -25,7 +20,22 @@ FAILURE_COLORS = {
     "electronics": "#9467bd",
     "crash": "#ff7f0e",
 }
-HOURS = "Flight hours"
+
+
+def _hours(lang: str) -> str:
+    return tr(lang, "ui.hours")
+
+
+def _model(lang: str, kind: str) -> str:
+    return bundle(lang)["model_labels"][kind]
+
+
+def _feature(lang: str, feature: str) -> str:
+    return bundle(lang)["feature_labels"][feature]
+
+
+def _mode(lang: str, mode: str) -> str:
+    return bundle(lang)["failure_mode_labels"].get(mode, mode)
 
 
 def _style(
@@ -114,15 +124,17 @@ def _km(data: pd.DataFrame, name: str, color: str, ci: bool = True) -> list[go.S
 # --- Overview ---------------------------------------------------------------
 
 
-def km_overall(pred: pd.DataFrame) -> go.Figure:
+def km_overall(pred: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Fleet-level Kaplan-Meier survival on test."""
-    fig = go.Figure(_km(pred, "Kaplan-Meier (all test drones)", KM_COLOR))
+    fig = go.Figure(_km(pred, tr(lang, "ui.km_all"), KM_COLOR))
     fig.update_yaxes(range=[0, 1.02])
-    return _style(fig, "Share of drones without failure by flight hours", HOURS, "S(t)")
+    return _style(fig, tr(lang, "ui.km_overall"), _hours(lang), "S(t)")
 
 
-def hazard(table: pd.DataFrame, with_models: bool) -> go.Figure:
-    """Smoothed observed hazard with its 95% band, optionally with model predictions."""
+def hazard(
+    table: pd.DataFrame, kinds: list[str] | None = None, lang: str = "en"
+) -> go.Figure:
+    """Smoothed observed hazard with its 95% band and, optionally, model rates."""
     obs = table[table["source"] == "observed"]
     t = obs["t"].to_numpy()
     fig = go.Figure(
@@ -151,52 +163,74 @@ def hazard(table: pd.DataFrame, with_models: bool) -> go.Figure:
                 x=t,
                 y=HAZARD_SCALE * obs["h"],
                 mode="lines",
-                name="Observed (smoothed Nelson-Aalen)",
+                name=tr(lang, "ui.km_observed"),
                 legendgroup="observed",
                 line={"color": KM_COLOR},
-                hovertemplate="%{x:.0f} h: %{y:.3f}<extra>observed</extra>",
+                hovertemplate="%{x:.0f} h: %{y:.3f}<extra>" + tr(lang, "ui.observed") + "</extra>",
             ),
         ]
     )
-    if with_models:
-        for kind, color in MODEL_COLORS.items():
-            part = table[table["source"] == kind]
-            fig.add_trace(
-                go.Scatter(
-                    x=part["t"],
-                    y=HAZARD_SCALE * part["h"],
-                    mode="lines",
-                    name=f"{MODEL_LABELS[kind]}: prediction",
-                    line={"color": color},
-                    hovertemplate="%{x:.0f} h: %{y:.3f}<extra>"
-                    + MODEL_LABELS[kind]
-                    + "</extra>",
-                )
+    for kind in kinds or []:
+        part = table[table["source"] == kind]
+        name = _model(lang, kind)
+        fig.add_trace(
+            go.Scatter(
+                x=part["t"],
+                y=HAZARD_SCALE * part["h"],
+                mode="lines",
+                name=tr(lang, "ui.prediction", model=name),
+                line={"color": MODEL_COLORS[kind]},
+                hovertemplate="%{x:.0f} h: %{y:.3f}<extra>" + name + "</extra>",
             )
+        )
     fig.update_yaxes(rangemode="tozero")
-    title = (
-        "Failure rate: predicted vs observed"
-        if with_models
-        else "Failure rate among drones still flying"
-    )
-    return _style(fig, title, HOURS, HAZARD_UNIT)
+    title = tr(lang, "ui.hazard_models" if kinds else "ui.hazard_observed")
+    return _style(fig, title, _hours(lang), bundle(lang)["hazard_unit"])
 
 
-def failure_modes(pred: pd.DataFrame) -> go.Figure:
+def failure_modes(pred: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Counts of observed failures by mechanism."""
     counts = pred.loc[pred["event"] == 1, "failure_mode"].value_counts().sort_values()
     fig = go.Figure(
         go.Bar(
             x=counts.to_numpy(),
-            y=[FAILURE_MODE_LABELS.get(m, m) for m in counts.index],
+            y=[_mode(lang, m) for m in counts.index],
             orientation="h",
             marker_color=[FAILURE_COLORS.get(m, "#999") for m in counts.index],
             text=[f"{c} ({c / counts.sum():.0%})" for c in counts.to_numpy()],
             textposition="auto",
-            hovertemplate="%{y}: %{x} failures<extra></extra>",
+            hovertemplate="%{y}: %{x}<extra></extra>",
         )
     )
-    return _style(fig, "Failure causes", "Number of failures", "", height=320)
+    return _style(fig, tr(lang, "ui.failure_causes"), tr(lang, "ui.number_of_failures"), "", height=320)
+
+
+def failure_mode_timing(pred: pd.DataFrame, lang: str = "en") -> go.Figure:
+    """Cumulative count of observed failures of each cause by flight hour."""
+    failed = pred[pred["event"] == 1]
+    times = np.sort(failed["duration_h"].unique())
+    fig = go.Figure()
+    for mode, color in FAILURE_COLORS.items():
+        event_times = np.sort(failed.loc[failed["failure_mode"] == mode, "duration_h"].to_numpy())
+        if len(event_times) == 0:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=times,
+                y=np.searchsorted(event_times, times, side="right"),
+                mode="lines",
+                line={"color": color, "shape": "hv"},
+                name=_mode(lang, mode),
+                hovertemplate="%{x:.0f} h: %{y}<extra>" + _mode(lang, mode) + "</extra>",
+            )
+        )
+    return _style(
+        fig,
+        tr(lang, "ui.failure_timing"),
+        _hours(lang),
+        tr(lang, "ui.cumulative_failures"),
+        320,
+    )
 
 
 # --- Segments ---------------------------------------------------------------
@@ -210,63 +244,82 @@ def _segment_levels(pred: pd.DataFrame, segment: str, order: list | None) -> lis
 
 
 def segment_km(
-    pred: pd.DataFrame, segment: str, order: list | None = None
+    pred: pd.DataFrame,
+    segment: str,
+    order: list | None = None,
+    lang: str = "en",
+    source_segment: str = "",
 ) -> go.Figure:
     """Kaplan-Meier curves per level of ``segment``."""
     fig = go.Figure()
+    shown = source_segment or segment
     for k, level in enumerate(_segment_levels(pred, segment, order)):
         part = pred[pred[segment] == level]
-        name = f"{level} (n={len(part)}, failures {int(part['event'].sum())})"
+        label = level_text(lang, shown, level) if shown in ("priority", "risk_group", "is_refurbished") else str(level)
+        name = tr(
+            lang,
+            "ui.segment_legend",
+            level=label,
+            n=len(part),
+            failures=int(part["event"].sum()),
+        )
         for trace in _km(part, name, PALETTE[k % len(PALETTE)], ci=False):
             fig.add_trace(trace)
     fig.update_yaxes(range=[0, 1.02])
-    return _style(fig, "Survival by segment (Kaplan-Meier)", HOURS, "S(t)", 430)
+    return _style(fig, tr(lang, "ui.segment_km"), _hours(lang), "S(t)", 430)
 
 
 def segment_failure_structure(
-    pred: pd.DataFrame, segment: str, order: list | None = None
+    pred: pd.DataFrame,
+    segment: str,
+    order: list | None = None,
+    lang: str = "en",
+    source_segment: str = "",
 ) -> go.Figure:
     """Share of drones in each segment that failed, split by failure mechanism."""
     levels = _segment_levels(pred, segment, order)
+    shown = source_segment or segment
+    labels = [
+        level_text(lang, shown, lv) if shown in ("priority", "risk_group", "is_refurbished") else str(lv)
+        for lv in levels
+    ]
     size = pred.groupby(segment)["drone_id"].count()
     fig = go.Figure()
     for mode, color in FAILURE_COLORS.items():
         failed = pred[pred["failure_mode"] == mode].groupby(segment)["drone_id"].count()
         share = (failed.reindex(levels).fillna(0) / size.reindex(levels)).to_numpy()
+        name = _mode(lang, mode)
         fig.add_trace(
             go.Bar(
-                x=[str(lv) for lv in levels],
+                x=labels,
                 y=share,
-                name=FAILURE_MODE_LABELS[mode],
+                name=name,
                 marker_color=color,
-                hovertemplate="%{x}: %{y:.1%}<extra>"
-                + FAILURE_MODE_LABELS[mode]
-                + "</extra>",
+                hovertemplate="%{x}: %{y:.1%}<extra>" + name + "</extra>",
             )
         )
     fig.update_layout(barmode="stack")
     fig.update_yaxes(tickformat=".0%")
-    return _style(
-        fig, "Share of failed drones and causes", "", "Share of segment drones", 430
-    )
+    return _style(fig, tr(lang, "ui.segment_structure"), "", tr(lang, "ui.share_of_segment"), 430)
 
 
 # --- Model quality ------------------------------------------------------------
 
 
-def learning_curves(models: dict[str, Model]) -> go.Figure:
+def learning_curves(models: dict[str, Model], lang: str = "en") -> go.Figure:
     """Train/valid loss per boosting iteration with the best iteration marked."""
     fig = make_subplots(
-        rows=1, cols=len(models), subplot_titles=[MODEL_LABELS[k] for k in models]
+        rows=1, cols=len(models), subplot_titles=[_model(lang, k) for k in models]
     )
     for col, (kind, model) in enumerate(models.items(), start=1):
         for k, (split, metrics) in enumerate(model.history.items()):
+            split_name = tr(lang, "ui.train" if split == "train" else "ui.valid")
             for metric, values in metrics.items():
                 fig.add_trace(
                     go.Scatter(
                         y=values,
                         mode="lines",
-                        name=f"{MODEL_LABELS[kind]} {split}",
+                        name=f"{_model(lang, kind)} {split_name}",
                         line={"color": PALETTE[k + 2 * (col - 1)]},
                         hovertemplate="iteration %{x}: %{y:.4f}<extra>"
                         + metric
@@ -283,11 +336,11 @@ def learning_curves(models: dict[str, Model]) -> go.Figure:
             col=col,
         )
     return _style(
-        fig, "Learning curves (dashed: best iteration)", "Boosting iteration", "Loss"
+        fig, tr(lang, "ui.learning"), tr(lang, "ui.boosting_iteration"), tr(lang, "ui.loss")
     )
 
 
-def survival_mean(table: pd.DataFrame) -> go.Figure:
+def survival_mean(table: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Mean predicted survival per model vs Kaplan-Meier on test."""
     km = table[table["source"] == "km"]
     fig = go.Figure(
@@ -296,7 +349,7 @@ def survival_mean(table: pd.DataFrame) -> go.Figure:
             km["s"].to_numpy(),
             km["ci_low"].to_numpy(),
             km["ci_high"].to_numpy(),
-            "Kaplan-Meier (observed)",
+            tr(lang, "ui.km_observed"),
             KM_COLOR,
         )
     )
@@ -307,16 +360,16 @@ def survival_mean(table: pd.DataFrame) -> go.Figure:
                 x=part["t"],
                 y=part["s"],
                 mode="lines",
-                name=f"{MODEL_LABELS[kind]}: mean prediction",
+                name=tr(lang, "ui.mean_prediction", model=_model(lang, kind)),
                 line={"color": color},
             )
         )
     fig.update_yaxes(range=[0, 1.02])
-    return _style(fig, "Predicted vs observed on test", HOURS, "S(t)")
+    return _style(fig, tr(lang, "ui.survival_mean"), _hours(lang), "S(t)")
 
 
 def individual_curves(
-    models: dict[str, Model], rows: pd.DataFrame, grid: np.ndarray
+    models: dict[str, Model], rows: pd.DataFrame, grid: np.ndarray, lang: str = "en"
 ) -> go.Figure:
     """Survival curves of selected drones (solid: Cox, dashed: AFT)."""
     fig = go.Figure()
@@ -328,7 +381,7 @@ def individual_curves(
                     x=grid,
                     y=curve[k],
                     mode="lines",
-                    name=f"{drone_id} {MODEL_LABELS[kind]}",
+                    name=f"{drone_id} {_model(lang, kind)}",
                     legendgroup=drone_id,
                     line={
                         "color": PALETTE[k % len(PALETTE)],
@@ -337,12 +390,10 @@ def individual_curves(
                 )
             )
     fig.update_yaxes(range=[0, 1.02])
-    return _style(
-        fig, "Individual curves (solid: Cox, dashed: AFT)", HOURS, "S(t)"
-    )
+    return _style(fig, tr(lang, "ui.individual_title"), _hours(lang), "S(t)")
 
 
-def brier_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame) -> go.Figure:
+def brier_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Time-dependent Brier score per model on test."""
     fig = go.Figure()
     for kind, part in brier_auc.groupby("model", sort=False):
@@ -352,14 +403,14 @@ def brier_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame) -> go.Figure:
                 x=part["t"],
                 y=part["brier"],
                 mode="lines",
-                name=f"{MODEL_LABELS[kind]} (IBS={ibs:.4f})",
+                name=f"{_model(lang, kind)} (IBS={ibs:.4f})",
                 line={"color": MODEL_COLORS[kind]},
             )
         )
-    return _style(fig, "Brier score over time (lower is better)", HOURS, "Brier score")
+    return _style(fig, tr(lang, "ui.brier_title"), _hours(lang), tr(lang, "ui.brier_score"))
 
 
-def auc_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame) -> go.Figure:
+def auc_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Cumulative/dynamic AUC per model on test."""
     fig = go.Figure()
     for kind, part in brier_auc.groupby("model", sort=False):
@@ -371,17 +422,15 @@ def auc_curve(brier_auc: pd.DataFrame, metrics: pd.DataFrame) -> go.Figure:
                 x=part["t"],
                 y=part["auc"],
                 mode="lines",
-                name=f"{MODEL_LABELS[kind]} (mean AUC={mean_auc:.4f})",
+                name=f"{_model(lang, kind)} (mean AUC={mean_auc:.4f})",
                 line={"color": MODEL_COLORS[kind]},
             )
         )
-    fig.add_hline(y=0.5, line_dash="dot", line_color="grey", annotation_text="random")
-    return _style(
-        fig, "AUC(t): separating drones failed by time t (higher is better)", HOURS, "AUC(t)"
-    )
+    fig.add_hline(y=0.5, line_dash="dot", line_color="grey", annotation_text=tr(lang, "ui.random"))
+    return _style(fig, tr(lang, "ui.auc_title"), _hours(lang), "AUC(t)")
 
 
-def calibration(table: pd.DataFrame, horizon: float) -> go.Figure:
+def calibration(table: pd.DataFrame, horizon: float, lang: str = "en") -> go.Figure:
     """Predicted vs observed survival at ``horizon`` by prediction decile."""
     part = table[np.isclose(table["horizon"], horizon)]
     fig = go.Figure(
@@ -389,7 +438,7 @@ def calibration(table: pd.DataFrame, horizon: float) -> go.Figure:
             x=[0, 1],
             y=[0, 1],
             mode="lines",
-            name="Perfect calibration",
+            name=tr(lang, "ui.perfect_calibration"),
             line={"color": "grey", "dash": "dot"},
         )
     )
@@ -399,7 +448,7 @@ def calibration(table: pd.DataFrame, horizon: float) -> go.Figure:
                 x=rows["predicted"],
                 y=rows["observed"],
                 mode="lines+markers",
-                name=MODEL_LABELS[kind],
+                name=_model(lang, kind),
                 line={"color": MODEL_COLORS[kind]},
                 customdata=rows["n"],
                 hovertemplate="predicted %{x:.2f}, observed %{y:.2f}, n=%{customdata}<extra></extra>",
@@ -409,19 +458,19 @@ def calibration(table: pd.DataFrame, horizon: float) -> go.Figure:
     fig.update_yaxes(range=[0, 1], scaleanchor="x", constrain="domain")
     return _style(
         fig,
-        f"Calibration at {horizon:.0f} h",
-        "Predicted S(t)",
-        "Observed S(t) (Kaplan-Meier)",
+        tr(lang, "ui.calibration_title", horizon=horizon),
+        tr(lang, "ui.predicted_s"),
+        tr(lang, "ui.observed_s"),
         430,
     )
 
 
-def bootstrap(samples: pd.DataFrame, summary: pd.DataFrame) -> go.Figure:
+def bootstrap(samples: pd.DataFrame, summary: pd.DataFrame, lang: str = "en") -> go.Figure:
     """Bootstrap distributions of metric differences between the first model pair."""
     a, b = summary.iloc[0][["model_a", "model_b"]]
     metrics = summary["metric"].tolist()
     titles = [
-        f"{METRIC_LABELS[m]}<br>p = {summary.set_index('metric').at[m, 'p_value']:.3f}"
+        f"{bundle(lang)['metric_labels'][m]}<br>p = {summary.set_index('metric').at[m, 'p_value']:.3f}"
         for m in metrics
     ]
     fig = make_subplots(rows=1, cols=len(metrics), subplot_titles=titles)
@@ -447,15 +496,14 @@ def bootstrap(samples: pd.DataFrame, summary: pd.DataFrame) -> go.Figure:
     fig.update_annotations(font_size=12)
     _style(
         fig,
-        f"Bootstrap: difference {MODEL_LABELS[a]} − {MODEL_LABELS[b]} "
-        "(red: 95% CI, black: no difference)",
+        tr(lang, "ui.bootstrap_title", a=_model(lang, a), b=_model(lang, b)),
         height=380,
     )
     fig.update_layout(margin={"t": 100})
     return fig
 
 
-def backtest(table: pd.DataFrame, landmark: float) -> go.Figure:
+def backtest(table: pd.DataFrame, landmark: float, lang: str = "en") -> go.Figure:
     """Conditional survival after the landmark: predicted vs Kaplan-Meier."""
     km = table[table["source"] == "km"]
     fig = go.Figure(
@@ -464,7 +512,7 @@ def backtest(table: pd.DataFrame, landmark: float) -> go.Figure:
             km["s"].to_numpy(),
             km["ci_low"].to_numpy(),
             km["ci_high"].to_numpy(),
-            "Kaplan-Meier (observed)",
+            tr(lang, "ui.km_observed"),
             KM_COLOR,
         )
     )
@@ -476,7 +524,7 @@ def backtest(table: pd.DataFrame, landmark: float) -> go.Figure:
                 x=part["u"],
                 y=part["s"],
                 mode="lines",
-                name=f"{MODEL_LABELS[kind]}: mean prediction",
+                name=tr(lang, "ui.mean_prediction", model=_model(lang, kind)),
                 line={"color": color},
             )
         )
@@ -484,14 +532,14 @@ def backtest(table: pd.DataFrame, landmark: float) -> go.Figure:
     fig.update_yaxes(range=[0, 1.02])
     return _style(
         fig,
-        f"Backtest: remaining life after {landmark:.0f} h",
-        "Additional flight hours",
-        "S(L + u) / S(L)",
+        tr(lang, "ui.backtest_title", landmark=landmark),
+        tr(lang, "ui.additional_hours"),
+        tr(lang, "ui.conditional_survival"),
     )
 
 
 def backtest_groups(
-    table: pd.DataFrame, best: str, window: float, landmark: float
+    table: pd.DataFrame, best: str, window: float, landmark: float, lang: str = "en"
 ) -> go.Figure:
     """Predicted vs observed failure probability within ``window`` by prediction quintile.
 
@@ -505,7 +553,7 @@ def backtest_groups(
             x=[0, top],
             y=[0, top],
             mode="lines",
-            name="Perfect calibration",
+            name=tr(lang, "ui.perfect_calibration"),
             line={"color": "grey", "dash": "dot"},
         )
     )
@@ -518,9 +566,9 @@ def backtest_groups(
                 y=rows["observed"],
                 mode="lines+markers",
                 name=(
-                    f"{MODEL_LABELS[kind]} before recalibration"
+                    tr(lang, "ui.before_recalibration", model=_model(lang, kind))
                     if raw
-                    else MODEL_LABELS[kind]
+                    else _model(lang, kind)
                 ),
                 line=(
                     {"color": "grey", "dash": "dash"}
@@ -546,16 +594,16 @@ def backtest_groups(
     fig.update_yaxes(range=[0, top], tickformat=".0%")
     return _style(
         fig,
-        f"Backtest by risk group: failure within {window:.0f} h after {landmark:.0f} h",
-        "Predicted probability",
-        "Observed share (Kaplan-Meier)",
+        tr(lang, "ui.backtest_groups", window=window, landmark=landmark),
+        tr(lang, "ui.predicted_p"),
+        tr(lang, "ui.observed_share"),
     )
 
 
 # --- Risk factors -------------------------------------------------------------
 
 
-def shap_importance(importance: pd.DataFrame, order_by: str) -> go.Figure:
+def shap_importance(importance: pd.DataFrame, order_by: str, lang: str = "en") -> go.Figure:
     """Share of total mean |SHAP| per feature and model."""
     order = (
         importance[importance["model"] == order_by]
@@ -568,20 +616,20 @@ def shap_importance(importance: pd.DataFrame, order_by: str) -> go.Figure:
         fig.add_trace(
             go.Bar(
                 x=part["share"],
-                y=[FEATURE_LABELS[f] for f in order],
+                y=[_feature(lang, f) for f in order],
                 orientation="h",
-                name=MODEL_LABELS[kind],
+                name=_model(lang, kind),
                 marker_color=color,
-                hovertemplate="%{y}: %{x:.1%}<extra>" + MODEL_LABELS[kind] + "</extra>",
+                hovertemplate="%{y}: %{x:.1%}<extra>" + _model(lang, kind) + "</extra>",
             )
         )
     fig.update_layout(barmode="group")
     fig.update_xaxes(tickformat=".0%")
-    return _style(fig, "Factor importance (share of total |SHAP|)", "", "", 560)
+    return _style(fig, tr(lang, "ui.shap_importance"), "", "", 560)
 
 
 def shap_beeswarm(
-    shap_values: pd.DataFrame, importance: pd.DataFrame, kind: str
+    shap_values: pd.DataFrame, importance: pd.DataFrame, kind: str, lang: str = "en"
 ) -> go.Figure:
     """Beeswarm-style scatter of SHAP values, coloured by within-feature value rank."""
     part = shap_values[shap_values["model"] == kind].copy()
@@ -605,9 +653,9 @@ def shap_beeswarm(
                 "colorscale": "Bluered",
                 "opacity": 0.6,
                 "colorbar": {
-                    "title": "Feature<br>value",
+                    "title": tr(lang, "ui.feature_value"),
                     "tickvals": [0, 1],
-                    "ticktext": ["low", "high"],
+                    "ticktext": [tr(lang, "ui.low"), tr(lang, "ui.high")],
                 },
             },
             customdata=np.c_[part["drone_id"], part["display"]],
@@ -617,19 +665,19 @@ def shap_beeswarm(
     )
     fig.add_vline(x=0, line_color="grey")
     fig.update_yaxes(
-        tickvals=list(range(len(order))), ticktext=[FEATURE_LABELS[f] for f in order]
+        tickvals=list(range(len(order))), ticktext=[_feature(lang, f) for f in order]
     )
     return _style(
         fig,
-        f"{MODEL_LABELS[kind]}: factor impact on risk (right: earlier failure)",
-        "SHAP (contribution to risk score)",
+        tr(lang, "ui.shap_beeswarm", model=_model(lang, kind)),
+        tr(lang, "ui.contribution"),
         "",
         560,
     )
 
 
 def shap_dependence(
-    shap_values: pd.DataFrame, kind: str, feature: str, categorical: bool
+    shap_values: pd.DataFrame, kind: str, feature: str, categorical: bool, lang: str = "en"
 ) -> go.Figure:
     """SHAP value of ``feature`` against its value."""
     part = shap_values[
@@ -664,8 +712,8 @@ def shap_dependence(
     fig.add_hline(y=0, line_color="grey")
     return _style(
         fig,
-        f"{MODEL_LABELS[kind]}: risk vs \"{FEATURE_LABELS[feature]}\"",
-        FEATURE_LABELS[feature],
+        tr(lang, "ui.shap_dependence", model=_model(lang, kind), feature=_feature(lang, feature)),
+        _feature(lang, feature),
         "SHAP",
         430,
     )
@@ -674,7 +722,7 @@ def shap_dependence(
 # --- Fleet and drone card -----------------------------------------------------
 
 
-def rul_histogram(active: pd.DataFrame, horizon: float) -> go.Figure:
+def rul_histogram(active: pd.DataFrame, horizon: float, lang: str = "en") -> go.Figure:
     """Distribution of median remaining useful life of drones in service."""
     finite = np.isfinite(active["rul_median"])
     fig = go.Figure(
@@ -686,9 +734,9 @@ def rul_histogram(active: pd.DataFrame, horizon: float) -> go.Figure:
     )
     return _style(
         fig,
-        f"Median remaining life ({int((~finite).sum())} drones > {horizon:.0f} h)",
-        HOURS,
-        "Drones",
+        tr(lang, "ui.rul_hist", n=int((~finite).sum()), horizon=horizon),
+        tr(lang, "ui.hours"),
+        tr(lang, "ui.drones"),
     )
 
 
@@ -700,6 +748,7 @@ def conditional_curves(
     names: list[str],
     title: str,
     dashes: list[str] | None = None,
+    lang: str = "en",
 ) -> go.Figure:
     """Conditional survival ``S(a + u) / S(a)`` for each row."""
     curves = model.conditional_survival(rows, ages, grid)
@@ -717,9 +766,11 @@ def conditional_curves(
                 },
             )
         )
-    fig.add_hline(y=0.5, line_dash="dot", line_color="grey", annotation_text="median")
+    fig.add_hline(y=0.5, line_dash="dot", line_color="grey", annotation_text=tr(lang, "ui.median_mark"))
     fig.update_yaxes(range=[0, 1.02])
-    return _style(fig, title, "Additional flight hours", "S(a + u) / S(a)")
+    return _style(
+        fig, title, tr(lang, "ui.additional_hours"), tr(lang, "ui.conditional_survival")
+    )
 
 
 def drone_survival(
@@ -728,6 +779,7 @@ def drone_survival(
     grid: np.ndarray,
     age: float,
     failed: bool,
+    lang: str = "en",
 ) -> go.Figure:
     """Unconditional survival of one drone under both models with its status marked."""
     fig = go.Figure()
@@ -737,7 +789,7 @@ def drone_survival(
                 x=grid,
                 y=model.survival(row, grid)[0],
                 mode="lines",
-                name=MODEL_LABELS[kind],
+                name=_model(lang, kind),
                 line={"color": MODEL_COLORS[kind]},
             )
         )
@@ -745,10 +797,10 @@ def drone_survival(
         x=age,
         line_dash="dash",
         line_color="red" if failed else "green",
-        annotation_text=f"failed at {age:.0f} h" if failed else f"flown {age:.0f} h",
+        annotation_text=tr(lang, "ui.failed_at" if failed else "ui.flown", age=age),
     )
     fig.update_yaxes(range=[0, 1.02])
-    return _style(fig, "Probability of operating without failure", HOURS, "S(t)")
+    return _style(fig, tr(lang, "ui.drone_survival"), tr(lang, "ui.hours"), "S(t)")
 
 
 def drone_hazard(
@@ -758,6 +810,7 @@ def drone_hazard(
     bandwidth: float,
     age: float,
     failed: bool,
+    lang: str = "en",
 ) -> go.Figure:
     """Hazard of one drone under both models with its status marked."""
     fig = go.Figure()
@@ -767,25 +820,25 @@ def drone_hazard(
                 x=grid,
                 y=HAZARD_SCALE * model.hazard(row, grid, bandwidth)[0],
                 mode="lines",
-                name=MODEL_LABELS[kind],
+                name=_model(lang, kind),
                 line={"color": MODEL_COLORS[kind]},
-                hovertemplate="%{x:.0f} h: %{y:.3f}<extra>"
-                + MODEL_LABELS[kind]
-                + "</extra>",
+                hovertemplate="%{x:.0f} h: %{y:.3f}<extra>" + _model(lang, kind) + "</extra>",
             )
         )
     fig.add_vline(
         x=age,
         line_dash="dash",
         line_color="red" if failed else "green",
-        annotation_text=f"failed at {age:.0f} h" if failed else f"flown {age:.0f} h",
+        annotation_text=tr(lang, "ui.failed_at" if failed else "ui.flown", age=age),
     )
     fig.update_yaxes(rangemode="tozero")
-    return _style(fig, "Failure rate of this drone by flight hours", HOURS, HAZARD_UNIT)
+    return _style(
+        fig, tr(lang, "ui.drone_hazard"), tr(lang, "ui.hours"), bundle(lang)["hazard_unit"]
+    )
 
 
 def shap_waterfall(
-    contrib: pd.DataFrame, base: float, kind: str, top: int = 12
+    contrib: pd.DataFrame, base: float, kind: str, top: int = 12, lang: str = "en"
 ) -> go.Figure:
     """Largest per-feature contributions to one drone's risk score."""
     rows = contrib.reindex(contrib["shap"].abs().sort_values().index).tail(top)
@@ -793,7 +846,7 @@ def shap_waterfall(
         go.Bar(
             x=rows["shap"],
             y=[
-                f"{FEATURE_LABELS[f]} = {v}"
+                f"{_feature(lang, f)} = {v}"
                 for f, v in zip(rows["feature"], rows["display"])
             ],
             orientation="h",
@@ -802,11 +855,42 @@ def shap_waterfall(
         )
     )
     total = base + contrib["shap"].sum()
+    title_key = "ui.waterfall_aft" if kind == "aft" else "ui.waterfall_cox"
+    axis_key = "ui.contribution_aft" if kind == "aft" else "ui.contribution"
     return _style(
         fig,
-        f"{MODEL_LABELS[kind]}: why this risk (base {base:.2f} → {total:.2f}; "
-        "red raises risk)",
-        "Contribution to risk score (SHAP)",
+        tr(lang, title_key, model=_model(lang, kind), base=base, total=total),
+        tr(lang, axis_key),
         "",
         460,
+    )
+
+
+def age_risk(active: pd.DataFrame, window: float, lang: str = "en") -> go.Figure:
+    """Hours already flown against the window failure probability, coloured by risk group."""
+    labels = bundle(lang)["priority_labels"]
+    colors = {"High": "#d62728", "Medium": "#ff7f0e", "Low": "#2ca02c"}
+    fig = go.Figure()
+    for group, color in colors.items():
+        part = active[active["risk_group"] == group]
+        if part.empty:
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=part["duration_h"],
+                y=part["p_fail_window"],
+                mode="markers",
+                name=labels.get(group, group),
+                marker={"color": color, "size": 7, "opacity": 0.75},
+                customdata=part["drone_id"],
+                hovertemplate="%{customdata}: %{x:.0f} h, %{y:.1%}<extra></extra>",
+            )
+        )
+    fig.update_yaxes(tickformat=".0%", rangemode="tozero")
+    return _style(
+        fig,
+        tr(lang, "ui.age_risk"),
+        tr(lang, "ui.hours"),
+        tr(lang, "ui.age_risk_y", window=window),
+        420,
     )

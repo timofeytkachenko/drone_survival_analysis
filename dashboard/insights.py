@@ -6,19 +6,16 @@ from sksurv.compare import compare_survival
 from sksurv.nonparametric import kaplan_meier_estimator
 from sksurv.util import Surv
 
-from dashboard.labels import (
-    FAILURE_MODE_LABELS,
-    FEATURE_LABELS,
-    HAZARD_SCALE,
-    METRIC_LABELS,
-    MODEL_LABELS,
-    PRIORITY_HIGH,
-    PRIORITY_LOW,
-    PRIORITY_MEDIUM,
-)
+from dashboard.labels import HAZARD_SCALE, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_MEDIUM
+from dashboard.locale import bundle, tr
 
 USELESS_BRIER = 0.25
 BONFERRONI_ALPHA = 0.05 / 4
+
+
+def _lab(lang: str, group: str, key: str) -> str:
+    labels = bundle(lang)[group]
+    return labels.get(key, str(key))
 
 
 def _km(data: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -41,8 +38,11 @@ def km_at(data: pd.DataFrame, times: np.ndarray) -> np.ndarray:
     return np.where(idx >= 0, s[np.clip(idx, 0, None)], 1.0)
 
 
-def hours_text(x: float) -> str:
-    return "not reached" if not np.isfinite(x) else f"{x:.0f} h"
+def hours_text(x: float, lang: str = "en") -> str:
+    """Hours, or the localized 'not reached' when the level is never crossed."""
+    if not np.isfinite(x):
+        return tr(lang, "phrases.not_reached")
+    return tr(lang, "ui.hours_value", hours=x)
 
 
 def _top_share(share: float) -> str:
@@ -50,52 +50,73 @@ def _top_share(share: float) -> str:
     return f"{max(share, 0.01):.0%}"
 
 
-def _pp(x: float) -> str:
+def _pp(x: float, lang: str) -> str:
     """Signed difference of probabilities in percentage points."""
-    return f"{x * 100:+.1f} pp"
+    return tr(lang, "phrases.pp", value=x * 100)
 
 
-def _ordinal(n: int) -> str:
-    """``1`` -> ``"1st"``, ``12`` -> ``"12th"``, ``22`` -> ``"22nd"``."""
+def _ordinal(n: int, lang: str) -> str:
+    """English ordinal; Russian templates add their own suffix to the number."""
+    if lang == "ru":
+        return str(n)
     suffix = (
         "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     )
     return f"{n}{suffix}"
 
 
+def _rate(h: float, lang: str) -> str:
+    """Hazard per flight hour as a rate per 100 flight hours."""
+    return tr(lang, "phrases.per_100h", rate=HAZARD_SCALE * h)
+
+
+def level_text(lang: str, segment: str, level: object) -> str:
+    """Display label of a segment level. Data codes other than priority stay as stored."""
+    if segment in ("priority", "risk_group"):
+        return _lab(lang, "priority_labels", str(level))
+    if segment == "is_refurbished":
+        flag = level if isinstance(level, bool) else str(level).lower() in {"true", "1", "yes"}
+        return tr(lang, "ui.yes" if flag else "ui.no")
+    return str(level)
+
+
 # --- Overview -------------------------------------------------------------------
 
 
-def overview(pred: pd.DataFrame) -> list[str]:
+def overview(pred: pd.DataFrame, lang: str = "en") -> list[str]:
     """Fleet-level survival and failure-mode facts."""
     median = km_median(pred)
     checkpoints = [t for t in (100, 250, 500) if t < pred["duration_h"].max()]
     surv = km_at(pred, np.array(checkpoints, dtype=float))
     out = [
-        f"Half of the test drones fail by **{hours_text(median)}** of flight "
-        "(Kaplan-Meier median)."
+        tr(lang, "phrases.overview_median", hours=hours_text(median, lang))
         if np.isfinite(median)
-        else "Fewer than half of the test drones failed during the observation period.",
-        "Drones still without failure: "
-        + ", ".join(f"at {t} h, **{s:.0%}**" for t, s in zip(checkpoints, surv))
-        + ".",
+        else tr(lang, "phrases.overview_no_median"),
+        tr(
+            lang,
+            "phrases.overview_still",
+            items=", ".join(
+                tr(lang, "phrases.overview_still_item", t=t, share=s)
+                for t, s in zip(checkpoints, surv)
+            ),
+        ),
     ]
     modes = pred.loc[pred["event"] == 1, "failure_mode"].value_counts(normalize=True)
     if len(modes) >= 2:
         out.append(
-            f"The most frequent failure is **{FAILURE_MODE_LABELS[modes.index[0]].lower()}** "
-            f"({modes.iloc[0]:.0%} of failures), followed by "
-            f"{FAILURE_MODE_LABELS[modes.index[1]].lower()} ({modes.iloc[1]:.0%})."
+            tr(
+                lang,
+                "phrases.overview_modes",
+                first=_lab(lang, "failure_mode_labels", modes.index[0]).lower(),
+                share0=modes.iloc[0],
+                second=_lab(lang, "failure_mode_labels", modes.index[1]).lower(),
+                share1=modes.iloc[1],
+            )
         )
     return out
 
 
-def _rate(h: float) -> str:
-    """Hazard per flight hour as a rate per 100 flight hours."""
-    return f"{HAZARD_SCALE * h:.2f} per 100 flight hours"
-
-
-def hazard_trend(table: pd.DataFrame) -> list[str]:
+def hazard_trend(table: pd.DataFrame, lang: str = "en") -> list[str]:
     """Level of the observed hazard and whether it rises or falls with age.
 
     The trend counts only when the first-third mean lies outside the mean 95%
@@ -105,41 +126,38 @@ def hazard_trend(table: pd.DataFrame) -> list[str]:
     h, t = obs["h"].to_numpy(), obs["t"].to_numpy()
     third = max(len(h) // 3, 1)
     early, late = h[:third].mean(), h[-third:].mean()
-    late_low, late_high = obs["ci_low"].iloc[-third:].mean(), obs["ci_high"].iloc[-third:].mean()
+    late_low = obs["ci_low"].iloc[-third:].mean()
+    late_high = obs["ci_high"].iloc[-third:].mean()
     share = 1 - np.exp(-HAZARD_SCALE * h.mean())
     out = [
-        (
-            f"Between {t[0]:.0f} and {t[-1]:.0f} h the observed failure rate averages "
-            f"**{_rate(h.mean())}**: about {share:.0%} of the drones still flying fail "
-            "within the next 100 flight hours."
+        tr(
+            lang,
+            "phrases.hazard_level",
+            t0=t[0],
+            t1=t[-1],
+            rate=_rate(h.mean(), lang),
+            share=share,
         )
     ]
-    change = f"from {_rate(early)} early on to {_rate(late)} at the end of this range"
+    change = tr(
+        lang,
+        "phrases.hazard_change",
+        early=_rate(early, lang),
+        late=_rate(late, lang),
+    )
     if late > early and early < late_low:
-        out.append(
-            f"The rate **rises** with age ({change}): wear-out. Older drones fail more "
-            "often, so maintenance or replacement by flight hours pays off."
-        )
+        out.append(tr(lang, "phrases.hazard_rises", change=change))
     elif late < early and early > late_high:
-        out.append(
-            f"The rate **falls** with age ({change}): early failures dominate. "
-            "Acceptance checks and burn-in of new drones pay off more than replacement "
-            "by age."
-        )
+        out.append(tr(lang, "phrases.hazard_falls", change=change))
     else:
-        out.append(
-            f"There is **no clear trend** with age ({change}, within the uncertainty "
-            "band): failures look random with respect to flight hours. Replacing a drone "
-            "just because it is old buys little; target maintenance by the drone's risk "
-            "factors instead (\"Fleet\" tab)."
-        )
+        out.append(tr(lang, "phrases.hazard_flat", change=change))
     return out
 
 
 # --- Segments -------------------------------------------------------------------
 
 
-def segments(pred: pd.DataFrame, segment: str, levels: list) -> list[str]:
+def segments(pred: pd.DataFrame, segment: str, levels: list, lang: str = "en") -> list[str]:
     """Log-rank test, survival at the fleet median and failure profile per level."""
     data = pred[pred[segment].isin(levels)]
     out = []
@@ -148,12 +166,11 @@ def segments(pred: pd.DataFrame, segment: str, levels: list) -> list[str]:
             data["event"].to_numpy().astype(bool), data["duration_h"].to_numpy()
         )
         chisq, p_value = compare_survival(y, data[segment].astype(str).to_numpy())
-        verdict = (
-            "**statistically significant**" if p_value < 0.05 else "**not significant**"
+        verdict = tr(
+            lang, "phrases.verdict_sig" if p_value < 0.05 else "phrases.verdict_ns"
         )
         out.append(
-            f"Survival differences between segments are {verdict}: log-rank "
-            f"χ² = {chisq:.1f}, p = {p_value:.2g}."
+            tr(lang, "phrases.segments_sig", verdict=verdict, chi=chisq, p=p_value)
         )
     t_ref = km_median(pred)
     if np.isfinite(t_ref):
@@ -162,9 +179,16 @@ def segments(pred: pd.DataFrame, segment: str, levels: list) -> list[str]:
         }
         worst, best = min(surv, key=surv.get), max(surv, key=surv.get)
         out.append(
-            f"Still without failure at {t_ref:.0f} h (fleet median): "
-            + ", ".join(f"{lv}: {s:.0%}" for lv, s in surv.items())
-            + f". Worst: **{worst}**, best: **{best}**."
+            tr(
+                lang,
+                "phrases.segments_at",
+                t=t_ref,
+                items=", ".join(
+                    f"{level_text(lang, segment, lv)}: {s:.0%}" for lv, s in surv.items()
+                ),
+                worst=level_text(lang, segment, worst),
+                best=level_text(lang, segment, best),
+            )
         )
     profile = []
     for lv in levels:
@@ -172,61 +196,70 @@ def segments(pred: pd.DataFrame, segment: str, levels: list) -> list[str]:
         if len(modes):
             share = modes.value_counts(normalize=True)
             profile.append(
-                f"{lv}: {FAILURE_MODE_LABELS[share.index[0]].lower()} ({share.iloc[0]:.0%})"
+                f"{level_text(lang, segment, lv)}: "
+                f"{_lab(lang, 'failure_mode_labels', share.index[0]).lower()} "
+                f"({share.iloc[0]:.0%})"
             )
     if profile:
-        out.append("Main failure cause: " + "; ".join(profile) + ".")
+        out.append(tr(lang, "phrases.segments_causes", items="; ".join(profile)))
     return out
 
 
 # --- Model quality ----------------------------------------------------------------
 
 
-def metrics(table: pd.DataFrame, best: str) -> list[str]:
+def metrics(table: pd.DataFrame, best: str, lang: str = "en") -> list[str]:
     """Interpretation of the metric table."""
     m = table.set_index(["model", "split"])
     test, val = m.loc[(best, "test")], m.loc[(best, "val")]
-    name = MODEL_LABELS[best]
+    name = _lab(lang, "model_labels", best)
     out = [
-        (
-            f"{name} on test: C-index (Uno) = **{test['c_index_ipcw']:.3f}**: in "
-            f"{test['c_index_ipcw']:.0%} of comparable drone pairs the model correctly "
-            "identifies which one fails first."
+        tr(lang, "phrases.metrics_c", name=name, c=test["c_index_ipcw"], share=test["c_index_ipcw"]),
+        tr(
+            lang,
+            "phrases.metrics_ibs",
+            ibs=test["ibs"],
+            useless=USELESS_BRIER,
+            drop=1 - test["ibs"] / USELESS_BRIER,
         ),
-        (
-            f"IBS = **{test['ibs']:.3f}** versus {USELESS_BRIER} for a 50/50 forecast: "
-            f"the probability error is {1 - test['ibs'] / USELESS_BRIER:.0%} lower."
+        tr(
+            lang,
+            "phrases.metrics_shift_flat"
+            if abs(test["ibs"] - val["ibs"]) < 0.01
+            else "phrases.metrics_shift",
+            c0=val["c_index_ipcw"],
+            c1=test["c_index_ipcw"],
+            i0=val["ibs"],
+            i1=test["ibs"],
         ),
-        f"From validation to test, C-index (Uno) changed from {val['c_index_ipcw']:.3f} "
-        f"to {test['c_index_ipcw']:.3f} and IBS from {val['ibs']:.3f} to "
-        f"{test['ibs']:.3f}. Test drones are newer and have fewer flight hours, so some "
-        "loss of discrimination on them is expected; IBS stays at the validation level, "
-        "so the model estimates probabilities just as accurately."
-        if abs(test["ibs"] - val["ibs"]) < 0.01
-        else f"From validation to test, C-index (Uno) changed from "
-        f"{val['c_index_ipcw']:.3f} to {test['c_index_ipcw']:.3f} and IBS from "
-        f"{val['ibs']:.3f} to {test['ibs']:.3f}.",
     ]
     others = [k for k in m.index.get_level_values("model").unique() if k != best]
     for other in others:
         o = m.loc[(other, "test")]
         wins = [
-            METRIC_LABELS[k]
-            for k in METRIC_LABELS
+            _lab(lang, "metric_labels", k)
+            for k in bundle(lang)["metric_labels"]
             if (test[k] < o[k] if k == "ibs" else test[k] > o[k])
         ]
         losses = [
-            METRIC_LABELS[k] for k in METRIC_LABELS if METRIC_LABELS[k] not in wins
+            _lab(lang, "metric_labels", k)
+            for k in bundle(lang)["metric_labels"]
+            if _lab(lang, "metric_labels", k) not in wins
         ]
         out.append(
-            f"On test, {name} beats {MODEL_LABELS[other]} on: "
-            f"{', '.join(wins) or '—'}; loses on: {', '.join(losses) or '—'}. "
-            "See the bootstrap comparison below for significance."
+            tr(
+                lang,
+                "phrases.metrics_beats",
+                name=name,
+                other=_lab(lang, "model_labels", other),
+                wins=", ".join(wins) or "—",
+                losses=", ".join(losses) or "—",
+            )
         )
     return out
 
 
-def learning(models: dict) -> list[str]:
+def learning(models: dict, lang: str = "en") -> list[str]:
     """Best iteration and validation-loss improvement per model."""
     out = []
     for kind, model in models.items():
@@ -234,16 +267,23 @@ def learning(models: dict) -> list[str]:
         best = model.booster.best_iteration
         start, end = values[0], values[best]
         out.append(
-            f"{MODEL_LABELS[kind]}: best iteration **{best}** of {len(values)} "
-            f"trained; validation loss ({metric}) went from {start:.3f} to "
-            f"{end:.3f} ({(end - start) / abs(start):+.0%}). The next "
-            f"{len(values) - best - 1} iterations brought no improvement, so "
-            "training stopped."
+            tr(
+                lang,
+                "phrases.learning",
+                name=_lab(lang, "model_labels", kind),
+                best=best,
+                n=len(values),
+                metric=metric,
+                start=start,
+                end=end,
+                change=(end - start) / abs(start),
+                rest=len(values) - best - 1,
+            )
         )
     return out
 
 
-def mean_vs_km(table: pd.DataFrame, t_max: float) -> list[str]:
+def mean_vs_km(table: pd.DataFrame, t_max: float, lang: str = "en") -> list[str]:
     """Largest gap between mean predicted survival and Kaplan-Meier up to ``t_max``.
 
     The Kaplan-Meier tail rests on few drones, so the comparison is cut at the
@@ -253,35 +293,34 @@ def mean_vs_km(table: pd.DataFrame, t_max: float) -> list[str]:
     out = []
     for kind in ("cox", "aft"):
         part = table[(table["source"] == kind) & (table["t"] <= t_max)]
-        idx = (
-            np.searchsorted(km["t"].to_numpy(), part["t"].to_numpy(), side="right") - 1
-        )
+        idx = np.searchsorted(km["t"].to_numpy(), part["t"].to_numpy(), side="right") - 1
         valid = idx >= 0
         s_km = km["s"].to_numpy()[idx[valid]]
-        lo, hi = (
-            km["ci_low"].to_numpy()[idx[valid]],
-            km["ci_high"].to_numpy()[idx[valid]],
-        )
+        lo, hi = km["ci_low"].to_numpy()[idx[valid]], km["ci_high"].to_numpy()[idx[valid]]
         s = part["s"].to_numpy()[valid]
         gap = s - s_km
         worst = np.abs(gap).argmax()
         inside = ((s >= lo) & (s <= hi)).mean()
-        tendency = "more optimistic" if gap.mean() > 0 else "more pessimistic"
-        out.append(
-            f"{MODEL_LABELS[kind]} (up to {t_max:.0f} h): the mean curve lies inside "
-            f"the 95% interval of the observed curve on **{inside:.0%}** of this range; "
-            f"largest gap {_pp(gap[worst])} at "
-            f"{part['t'].to_numpy()[valid][worst]:.0f} h; on average the model is "
-            f"{tendency} than the data."
+        tendency = tr(
+            lang, "phrases.optimistic" if gap.mean() > 0 else "phrases.pessimistic"
         )
-    out.append(
-        f"Beyond {t_max:.0f} h the observed curve rests on few drones (wide band), so "
-        "gaps there carry little information."
-    )
+        out.append(
+            tr(
+                lang,
+                "phrases.mean_gap",
+                name=_lab(lang, "model_labels", kind),
+                t=t_max,
+                inside=inside,
+                gap=_pp(gap[worst], lang),
+                at=part["t"].to_numpy()[valid][worst],
+                tendency=tendency,
+            )
+        )
+    out.append(tr(lang, "phrases.mean_tail", t=t_max))
     return out
 
 
-def hazard_fit(table: pd.DataFrame) -> list[str]:
+def hazard_fit(table: pd.DataFrame, lang: str = "en") -> list[str]:
     """How closely each model's group hazard follows the observed one."""
     obs = table[table["source"] == "observed"]
     out = []
@@ -289,48 +328,68 @@ def hazard_fit(table: pd.DataFrame) -> list[str]:
         h = table.loc[table["source"] == kind, "h"].to_numpy()
         inside = ((h >= obs["ci_low"].to_numpy()) & (h <= obs["ci_high"].to_numpy())).mean()
         bias = h.mean() / obs["h"].mean() - 1
-        tendency = "higher" if bias > 0 else "lower"
         out.append(
-            f"{MODEL_LABELS[kind]}: the predicted rate lies inside the 95% band of the "
-            f"observed one on **{inside:.0%}** of the range and is on average "
-            f"{abs(bias):.0%} {tendency} than observed."
+            tr(
+                lang,
+                "phrases.hazard_fit",
+                name=_lab(lang, "model_labels", kind),
+                inside=inside,
+                bias=abs(bias),
+                tendency=tr(lang, "phrases.higher" if bias > 0 else "phrases.lower"),
+            )
         )
     return out
 
 
-def brier(table: pd.DataFrame) -> list[str]:
+def brier(table: pd.DataFrame, lang: str = "en") -> list[str]:
     """Peak Brier score per model."""
     out = []
     for kind, part in table.groupby("model", sort=False):
         peak = part.loc[part["brier"].idxmax()]
+        key = "phrases.brier_ok" if part["brier"].max() < USELESS_BRIER else "phrases.brier_bad"
         out.append(
-            f"{MODEL_LABELS[kind]}: peak error {peak['brier']:.3f} at "
-            f"{peak['t']:.0f} h, the most uncertain period when most drones fail; "
-            "below the 0.25 benchmark everywhere."
-            if part["brier"].max() < USELESS_BRIER
-            else f"{MODEL_LABELS[kind]}: at {peak['t']:.0f} h the error {peak['brier']:.3f} "
-            "reaches the level of a useless forecast."
+            tr(
+                lang,
+                key,
+                name=_lab(lang, "model_labels", kind),
+                brier=peak["brier"],
+                t=peak["t"],
+            )
         )
     return out
 
 
-def auc(table: pd.DataFrame) -> list[str]:
+def auc(table: pd.DataFrame, lang: str = "en") -> list[str]:
     """AUC(t) range per model."""
     out = []
     for kind, part in table.groupby("model", sort=False):
         lo, hi = part.loc[part["auc"].idxmin()], part.loc[part["auc"].idxmax()]
-        out.append(
-            f"{MODEL_LABELS[kind]}: AUC from {lo['auc']:.3f} (at {lo['t']:.0f} h) to "
-            f"{hi['auc']:.3f} (at {hi['t']:.0f} h); the model is consistently better "
-            "than random at every horizon."
-            if lo["auc"] > 0.55
-            else f"{MODEL_LABELS[kind]}: at {lo['t']:.0f} h AUC drops to "
-            f"{lo['auc']:.3f}; at this horizon the model barely separates drones."
-        )
+        if lo["auc"] > 0.55:
+            out.append(
+                tr(
+                    lang,
+                    "phrases.auc_ok",
+                    name=_lab(lang, "model_labels", kind),
+                    lo=lo["auc"],
+                    t0=lo["t"],
+                    hi=hi["auc"],
+                    t1=hi["t"],
+                )
+            )
+        else:
+            out.append(
+                tr(
+                    lang,
+                    "phrases.auc_bad",
+                    name=_lab(lang, "model_labels", kind),
+                    t=lo["t"],
+                    auc=lo["auc"],
+                )
+            )
     return out
 
 
-def calibration(table: pd.DataFrame, horizon: float) -> list[str]:
+def calibration(table: pd.DataFrame, horizon: float, lang: str = "en") -> list[str]:
     """Weighted absolute and signed calibration error per model."""
     part = table[np.isclose(table["horizon"], horizon)]
     out = []
@@ -338,51 +397,63 @@ def calibration(table: pd.DataFrame, horizon: float) -> list[str]:
         w = rows["n"] / rows["n"].sum()
         gap = rows["predicted"] - rows["observed"]
         mae, bias = float((w * gap.abs()).sum()), float((w * gap).sum())
-        direction = (
-            "overestimates reliability (predicted survival above observed)"
-            if bias > 0
-            else "underestimates reliability (predicted survival below observed)"
-        )
         out.append(
-            f"{MODEL_LABELS[kind]}: mean calibration error at {horizon:.0f} h is "
-            f"**{mae * 100:.1f} pp**; on average the model {direction} by "
-            f"{abs(bias) * 100:.1f} pp."
+            tr(
+                lang,
+                "phrases.calibration",
+                name=_lab(lang, "model_labels", kind),
+                h=horizon,
+                mae=mae * 100,
+                direction=tr(
+                    lang, "phrases.calib_over" if bias > 0 else "phrases.calib_under"
+                ),
+                bias=abs(bias) * 100,
+            )
         )
     return out
 
 
-def bootstrap(summary: pd.DataFrame) -> list[str]:
+def bootstrap(summary: pd.DataFrame, lang: str = "en") -> list[str]:
     """Plain-language verdict per metric."""
     out = []
     for row in summary.itertuples():
-        a, b = MODEL_LABELS[row.model_a], MODEL_LABELS[row.model_b]
         if row.significant:
-            strict = (
-                " and passes the strict threshold corrected for multiple comparisons"
+            strict = tr(
+                lang,
+                "phrases.boot_strict_yes"
                 if row.p_value < BONFERRONI_ALPHA
-                else ", but does not pass the strict Bonferroni threshold (0.0125)"
+                else "phrases.boot_strict_no",
             )
-            verdict = (
-                f"**{MODEL_LABELS[row.better]} is significantly better** "
-                f"(p = {row.p_value:.3f}){strict}"
+            verdict = tr(
+                lang,
+                "phrases.boot_better",
+                name=_lab(lang, "model_labels", row.better),
+                p=row.p_value,
+                strict=strict,
             )
         else:
-            verdict = f"the difference is **not significant** (p = {row.p_value:.3f})"
+            verdict = tr(lang, "phrases.boot_ns", p=row.p_value)
         out.append(
-            f"{METRIC_LABELS[row.metric]}: {a} − {b} = {row.diff:+.4f}, 95% CI "
-            f"[{row.ci_low:+.4f}; {row.ci_high:+.4f}]: {verdict}."
+            tr(
+                lang,
+                "phrases.boot_line",
+                metric=_lab(lang, "metric_labels", row.metric),
+                a=_lab(lang, "model_labels", row.model_a),
+                b=_lab(lang, "model_labels", row.model_b),
+                diff=row.diff,
+                lo=row.ci_low,
+                hi=row.ci_high,
+                verdict=verdict,
+            )
         )
-    out.append(
-        "Bottom line: the models are close in quality; the best one is chosen by "
-        "validation IBS, not by test, so the test stays an independent check."
-    )
+    out.append(tr(lang, "phrases.boot_bottom"))
     return out
 
 
 # --- Risk factors ------------------------------------------------------------------
 
 
-def shap_top(importance: pd.DataFrame, kind: str, n: int = 5) -> list[str]:
+def shap_top(importance: pd.DataFrame, kind: str, n: int = 5, lang: str = "en") -> list[str]:
     """Top features of ``kind`` and their agreement with the other model."""
     ranked = importance[importance["model"] == kind].nlargest(n, "share")
     others = {
@@ -391,45 +462,62 @@ def shap_top(importance: pd.DataFrame, kind: str, n: int = 5) -> list[str]:
         if k != kind
     }
     out = [
-        f"Top {n} factors of {MODEL_LABELS[kind]}: "
-        + ", ".join(
-            f'"{FEATURE_LABELS[f]}" ({s:.0%})'
-            for f, s in zip(ranked["feature"], ranked["share"])
+        tr(
+            lang,
+            "phrases.shap_top",
+            n=n,
+            name=_lab(lang, "model_labels", kind),
+            items=", ".join(
+                tr(
+                    lang,
+                    "phrases.shap_item",
+                    label=_lab(lang, "feature_labels", feature),
+                    share=share,
+                )
+                for feature, share in zip(ranked["feature"], ranked["share"])
+            ),
+            share=ranked["share"].sum(),
         )
-        + f"; together **{ranked['share'].sum():.0%}** of the influence."
     ]
     for other, top in others.items():
-        common = [FEATURE_LABELS[f] for f in ranked["feature"] if f in top]
+        common = [_lab(lang, "feature_labels", f) for f in ranked["feature"] if f in top]
         out.append(
-            f"{len(common)} of the top {n} factors match the {MODEL_LABELS[other]} "
-            f"model ({', '.join(common) or '—'}): the larger the overlap, the more "
-            "reliable the conclusion."
+            tr(
+                lang,
+                "phrases.shap_overlap",
+                k=len(common),
+                n=n,
+                other=_lab(lang, "model_labels", other),
+                items=", ".join(common) or "—",
+            )
         )
     return out
 
 
 def shap_direction(
-    shap_values: pd.DataFrame, kind: str, feature: str, categorical: bool
+    shap_values: pd.DataFrame,
+    kind: str,
+    feature: str,
+    categorical: bool,
+    lang: str = "en",
 ) -> list[str]:
     """Where the feature raises and lowers risk."""
-    part = shap_values[
-        (shap_values["model"] == kind) & (shap_values["feature"] == feature)
-    ]
-    label = FEATURE_LABELS[feature]
-    spread = (
-        f"The contribution to risk ranges from {part['shap'].min():+.3f} "
-        f"to {part['shap'].max():+.3f}."
-    )
+    part = shap_values[(shap_values["model"] == kind) & (shap_values["feature"] == feature)]
+    label = _lab(lang, "feature_labels", feature)
+    spread = tr(lang, "phrases.shap_spread", lo=part["shap"].min(), hi=part["shap"].max())
     if categorical:
-        means = (
-            part.groupby("display")["shap"].agg(["mean", "size"]).sort_values("mean")
-        )
+        means = part.groupby("display")["shap"].agg(["mean", "size"]).sort_values("mean")
         return [
-            (
-                f'Highest risk at "{label}" = **{means.index[-1]}** (mean contribution '
-                f"{means['mean'].iloc[-1]:+.3f}, {int(means['size'].iloc[-1])} drones), "
-                f"lowest at **{means.index[0]}** ({means['mean'].iloc[0]:+.3f}, "
-                f"{int(means['size'].iloc[0])} drones)."
+            tr(
+                lang,
+                "phrases.shap_cat",
+                label=label,
+                high=means.index[-1],
+                high_v=means["mean"].iloc[-1],
+                high_n=int(means["size"].iloc[-1]),
+                low=means.index[0],
+                low_v=means["mean"].iloc[0],
+                low_n=int(means["size"].iloc[0]),
             ),
             spread,
         ]
@@ -438,15 +526,11 @@ def shap_direction(
     means = data.groupby(bins, observed=True)["shap"].mean()
     rho = data["value"].corr(data["shap"], method="spearman")
     if rho > 0.5:
-        shape = f'Monotonic relationship: **the higher "{label}", the higher the risk** (ρ = {rho:.2f}).'
+        shape = tr(lang, "phrases.shap_up", label=label, rho=rho)
     elif rho < -0.5:
-        shape = f'Monotonic relationship: **the higher "{label}", the lower the risk** (ρ = {rho:.2f}).'
+        shape = tr(lang, "phrases.shap_down", label=label, rho=rho)
     else:
-        shape = (
-            f"**Non-monotonic** relationship (ρ = {rho:.2f}): risk depends on the range "
-            "of values rather than simply rising or falling; look at the shape of the cloud."
-        )
-
+        shape = tr(lang, "phrases.shap_nonmono", rho=rho)
     lowest = data["value"].min()
 
     def interval(iv: pd.Interval) -> str:
@@ -454,10 +538,13 @@ def shap_direction(
 
     return [
         shape,
-        (
-            f"Highest mean contribution ({means.max():+.3f}) at values "
-            f"**{interval(means.idxmax())}**, lowest ({means.min():+.3f}) at "
-            f"**{interval(means.idxmin())}**."
+        tr(
+            lang,
+            "phrases.shap_bins",
+            hi=means.max(),
+            high=interval(means.idxmax()),
+            lo=means.min(),
+            low=interval(means.idxmin()),
         ),
         spread,
     ]
@@ -466,57 +553,66 @@ def shap_direction(
 # --- Fleet and drone card -------------------------------------------------------------
 
 
-def fleet(active: pd.DataFrame, window: float, horizon: float) -> list[str]:
+def fleet(active: pd.DataFrame, window: float, horizon: float, lang: str = "en") -> list[str]:
     """Operational summary of drones in service."""
     counts = active["priority"].value_counts()
     finite = active.loc[np.isfinite(active["rul_median"]), "rul_median"]
-    expected = active["p_fail_window"].sum()
-    above_10 = (active["p_fail_window"] > 0.1).mean()
     return [
-        (
-            f"{len(active)} drones in service: high maintenance priority "
-            f"**{counts.get(PRIORITY_HIGH, 0)}**, medium **{counts.get(PRIORITY_MEDIUM, 0)}**, "
-            f"low {counts.get(PRIORITY_LOW, 0)}."
+        tr(
+            lang,
+            "phrases.fleet_counts",
+            n=len(active),
+            high=int(counts.get(PRIORITY_HIGH, 0)),
+            medium=int(counts.get(PRIORITY_MEDIUM, 0)),
+            low=int(counts.get(PRIORITY_LOW, 0)),
         ),
-        (
-            f"Expected number of failures in the fleet over the next {window:.0f} flight "
-            f"hours (sum of probabilities): **≈ {expected:.0f}** drones. Use it as a "
-            "benchmark for spare parts and backup drones."
+        tr(
+            lang,
+            "phrases.fleet_expected",
+            window=window,
+            expected=active["p_fail_window"].sum(),
         ),
-        (
-            f"{above_10:.0%} of drones in service have a failure probability above 10% "
-            f"in the next {window:.0f} h: failures are spread across the whole fleet "
-            'rather than concentrated in a few "bad" drones.'
+        tr(
+            lang,
+            "phrases.fleet_spread",
+            share=(active["p_fail_window"] > 0.1).mean(),
+            window=window,
         ),
-        (
-            f"Fleet median remaining life is {finite.median():.0f} h; drones with a "
-            f"median beyond the {horizon:.0f} h horizon: {len(active) - len(finite)}."
+        tr(
+            lang,
+            "phrases.fleet_median",
+            median=finite.median(),
+            horizon=horizon,
+            beyond=len(active) - len(finite),
         ),
     ]
 
 
-def backtest(table: pd.DataFrame, landmark: float) -> list[str]:
+def backtest(table: pd.DataFrame, landmark: float, lang: str = "en") -> list[str]:
     """Largest gap between predicted conditional survival and Kaplan-Meier."""
     km = table[table["source"] == "km"]
     out = []
     for kind in ("cox", "aft"):
         part = table[(table["source"] == kind) & (table["u"] <= km["u"].max())]
-        idx = (
-            np.searchsorted(km["u"].to_numpy(), part["u"].to_numpy(), side="right") - 1
-        )
+        idx = np.searchsorted(km["u"].to_numpy(), part["u"].to_numpy(), side="right") - 1
         s_km = np.where(idx >= 0, km["s"].to_numpy()[np.clip(idx, 0, None)], 1.0)
         gap = part["s"].to_numpy() - s_km
         worst = np.abs(gap).argmax()
         out.append(
-            f"{MODEL_LABELS[kind]}: largest gap between predicted and observed remaining "
-            f"life after {landmark:.0f} h is {_pp(gap[worst])} (after "
-            f"{part['u'].to_numpy()[worst]:.0f} h), mean gap "
-            f"{np.abs(gap).mean() * 100:.1f} pp."
+            tr(
+                lang,
+                "phrases.backtest_gap",
+                name=_lab(lang, "model_labels", kind),
+                landmark=landmark,
+                gap=_pp(gap[worst], lang),
+                u=part["u"].to_numpy()[worst],
+                mean=np.abs(gap).mean() * 100,
+            )
         )
     return out
 
 
-def backtest_groups(table: pd.DataFrame, best: str) -> list[str]:
+def backtest_groups(table: pd.DataFrame, best: str, lang: str = "en") -> list[str]:
     """Agreement of predicted and observed failure shares across prediction quintiles."""
     out = []
     riskiest = table[table["quintile"] == table["quintile"].max()].set_index("source")
@@ -525,17 +621,28 @@ def backtest_groups(table: pd.DataFrame, best: str) -> list[str]:
         gap = (rows["predicted"] - rows["observed"]).abs()
         top = riskiest.loc[kind]
         out.append(
-            f"{MODEL_LABELS[kind]}: the forecast lies inside the 95% interval of the "
-            f"observed share in **{inside} of {len(rows)}** groups; mean gap "
-            f"{np.average(gap, weights=rows['n']) * 100:.1f} pp. Riskiest group: "
-            f"predicted {top['predicted']:.0%}, observed {top['observed']:.0%} "
-            f"(interval {top['ci_low']:.0%}–{top['ci_high']:.0%})."
+            tr(
+                lang,
+                "phrases.backtest_group",
+                name=_lab(lang, "model_labels", kind),
+                inside=int(inside),
+                n=len(rows),
+                gap=np.average(gap, weights=rows["n"]) * 100,
+                pred=top["predicted"],
+                obs=top["observed"],
+                lo=top["ci_low"],
+                hi=top["ci_high"],
+            )
         )
     if "raw" in riskiest.index:
-        before, after = riskiest.loc["raw", "predicted"], riskiest.loc[best, "predicted"]
         out.append(
-            f"Before the recalibration {MODEL_LABELS[best]} predicted {before:.0%} for "
-            f"its riskiest group; the recalibration changes it to {after:.0%}."
+            tr(
+                lang,
+                "phrases.backtest_raw",
+                name=_lab(lang, "model_labels", best),
+                before=riskiest.loc["raw", "predicted"],
+                after=riskiest.loc[best, "predicted"],
+            )
         )
     return out
 
@@ -547,82 +654,100 @@ def drone(
     best: str,
     window: float,
     predicted_median: float,
+    lang: str = "en",
 ) -> list[str]:
     """Narrative explanation of one drone's prediction."""
     out = []
     top = (pred[f"risk_{best}"] >= row[f"risk_{best}"]).mean()
     if row["event"] == 1:
-        mode = FAILURE_MODE_LABELS.get(row["failure_mode"], row["failure_mode"])
         timing = (
-            ("before" if row["duration_h"] < predicted_median else "after")
+            (tr(lang, "phrases.before") if row["duration_h"] < predicted_median else tr(lang, "phrases.after"))
             if np.isfinite(predicted_median)
             else "—"
         )
         out.append(
-            f"The drone **failed** at {row['duration_h']:.0f} flight hours (cause: "
-            f"{mode.lower()}). For a drone with these characteristics the model expected "
-            f"a median time to failure of {hours_text(predicted_median)}; the failure "
-            f"happened {timing} the median."
+            tr(
+                lang,
+                "phrases.drone_failed",
+                hours=row["duration_h"],
+                mode=_lab(lang, "failure_mode_labels", row["failure_mode"]).lower(),
+                median=hours_text(predicted_median, lang),
+                when=timing,
+            )
         )
     elif not row["in_service"]:
-        out.append(
-            f"The drone **left the fleet** without a failure after "
-            f"{row['duration_h']:.0f} flight hours (sold, lost or retired), so it has "
-            "no remaining-life forecast."
-        )
+        out.append(tr(lang, "phrases.drone_left", hours=row["duration_h"]))
     else:
         active = pred[pred["in_service"]]
         rank = int((active["p_fail_window"] > row["p_fail_window"]).sum()) + 1
         out.append(
-            f"The drone is **in service** with {row['duration_h']:.0f} h flown without "
-            f"failure. Failure probability in the next {window:.0f} h is "
-            f"**{row['p_fail_window']:.0%}**: {_ordinal(rank)} of {len(active)} drones "
-            f"in service on this measure; maintenance priority **{row['priority']}**."
+            tr(
+                lang,
+                "phrases.drone_in_service",
+                hours=row["duration_h"],
+                window=window,
+                p=row["p_fail_window"],
+                rank=_ordinal(rank, lang),
+                n=len(active),
+                priority=_lab(lang, "priority_labels", row["priority"]),
+            )
         )
     bottom = (pred[f"risk_{best}"] <= row[f"risk_{best}"]).mean()
-    position = (
-        f"the **{_top_share(top)}** riskiest"
-        if top <= 0.5
-        else f"the **{_top_share(bottom)}** least risky"
+    position = tr(
+        lang,
+        "phrases.riskiest_share" if top <= 0.5 else "phrases.least_share",
+        share=_top_share(top if top <= 0.5 else bottom),
     )
     out.append(
-        f"By the model's risk score the drone is among {position} test drones (risk "
-        f"group: {row['risk_group']})."
+        tr(
+            lang,
+            "phrases.drone_rank",
+            position=position,
+            group=_lab(lang, "priority_labels", row["risk_group"]),
+        )
     )
+
+    def bits(frame: pd.DataFrame) -> str:
+        return "; ".join(
+            tr(
+                lang,
+                "phrases.factor_bits",
+                label=_lab(lang, "feature_labels", feature),
+                value=value,
+                shap=shap,
+            )
+            for feature, value, shap in zip(frame["feature"], frame["display"], frame["shap"])
+        )
+
     up = contrib[contrib["shap"] > 0].nlargest(3, "shap")
     down = contrib[contrib["shap"] < 0].nsmallest(3, "shap")
     if len(up):
-        out.append(
-            "Factors that **raise** risk the most: "
-            + "; ".join(
-                f"{FEATURE_LABELS[f]} = {v} ({s:+.3f})"
-                for f, v, s in zip(up["feature"], up["display"], up["shap"])
-            )
-            + "."
-        )
+        out.append(tr(lang, "phrases.raises", items=bits(up)))
     if len(down):
-        out.append(
-            "Factors that **lower** risk the most: "
-            + "; ".join(
-                f"{FEATURE_LABELS[f]} = {v} ({s:+.3f})"
-                for f, v, s in zip(down["feature"], down["display"], down["shap"])
-            )
-            + "."
-        )
+        out.append(tr(lang, "phrases.lowers", items=bits(down)))
     return out
 
 
-def drone_hazard(age: float, rate: float, fleet_rate: float, best: str) -> str:
+def drone_hazard(
+    age: float, rate: float, fleet_rate: float, best: str, lang: str = "en"
+) -> str:
     """Current failure rate of a drone in service, relative to the fleet at that age."""
-    text = (
-        f"At its current {age:.0f} flight hours the drone's failure rate is "
-        f"**{_rate(rate)}** ({MODEL_LABELS[best]})"
-    )
     if fleet_rate <= 0:
-        return text + "."
-    return (
-        text + f": **{rate / fleet_rate:.1f}×** the observed rate of test drones at the "
-        f"same age ({_rate(fleet_rate)})."
+        return tr(
+            lang,
+            "phrases.drone_rate_only",
+            age=age,
+            rate=_rate(rate, lang),
+            model=_lab(lang, "model_labels", best),
+        )
+    return tr(
+        lang,
+        "phrases.drone_rate",
+        age=age,
+        rate=_rate(rate, lang),
+        model=_lab(lang, "model_labels", best),
+        ratio=rate / fleet_rate,
+        fleet=_rate(fleet_rate, lang),
     )
 
 
@@ -631,28 +756,48 @@ def whatif(
     new: pd.Series,
     changes: list[tuple[str, object, object]],
     window: float,
+    lang: str = "en",
 ) -> list[str]:
     """Narrative comparison of the current and scenario remaining-life summaries."""
     if not changes:
-        return ["No inputs changed: the scenario matches the current conditions."]
+        return [tr(lang, "phrases.whatif_same")]
     out = [
-        "Changed: "
-        + "; ".join(f"{FEATURE_LABELS[f]}: {old} → {new_}" for f, old, new_ in changes)
-        + "."
+        tr(
+            lang,
+            "phrases.whatif_changed",
+            items="; ".join(
+                tr(
+                    lang,
+                    "phrases.whatif_change",
+                    label=_lab(lang, "feature_labels", feature),
+                    old=old,
+                    new=new_,
+                )
+                for feature, old, new_ in changes
+            ),
+        )
     ]
     dp = new["p_fail_window"] - base["p_fail_window"]
-    effect = "lowers" if dp < 0 else "raises"
     out.append(
-        f"The scenario {effect} the failure probability in the next {window:.0f} h from "
-        f"{base['p_fail_window']:.1%} to **{new['p_fail_window']:.1%}** ({_pp(dp)})."
+        tr(
+            lang,
+            "phrases.whatif_p_down" if dp < 0 else "phrases.whatif_p_up",
+            window=window,
+            before=base["p_fail_window"],
+            after=new["p_fail_window"],
+            delta=_pp(dp, lang),
+        )
     )
     out.append(
-        f"Expected remaining life changes from {base['rmrl']:.0f} to "
-        f"**{new['rmrl']:.0f} h** ({new['rmrl'] - base['rmrl']:+.0f} h); median from "
-        f"{hours_text(base['rul_median'])} to {hours_text(new['rul_median'])}."
+        tr(
+            lang,
+            "phrases.whatif_life",
+            before=base["rmrl"],
+            after=new["rmrl"],
+            delta=new["rmrl"] - base["rmrl"],
+            med0=hours_text(base["rul_median"], lang),
+            med1=hours_text(new["rul_median"], lang),
+        )
     )
-    out.append(
-        "This is the model's forecast with everything else held equal, not a guaranteed "
-        "effect: the model learned associations from historical data, not causal mechanisms."
-    )
+    out.append(tr(lang, "phrases.whatif_caveat"))
     return out
