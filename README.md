@@ -25,7 +25,7 @@ To do this it uses **survival analysis**: a family of statistical methods for "t
 - [Scoring new drones](#scoring-new-drones)
 - [Limitations and assumptions](#limitations-and-assumptions)
 - [FAQ](#faq)
-- [Running the project](#running-the-project)
+- [Running the project](#running-the-project) (including the [Docker studio](#training-and-scoring-studio-docker))
 - [Project structure](#project-structure)
 - [Glossary](#glossary)
 
@@ -39,18 +39,18 @@ These are the results of the current run (`artifacts/meta.json`). After re-runni
 |---|---|
 | Drones in the data | 5000; 61% failed during the observation period, 39% are censored |
 | Test set | 1001 drones commissioned from 2025-04-10 onwards |
-| Best model (selected on validation) | Cox |
-| C-index (Uno) on test | 0.665: in 66% of comparable pairs the model correctly identifies which drone fails first |
-| Integrated Brier score on test | 0.171 versus 0.25 for a 50/50 forecast |
-| Drones in service in the test set | 500: 6 high, 115 medium and 379 low maintenance priority |
+| Best model (selected on validation) | AFT (log-logistic). Cox is within 0.0005 IBS on validation, so the choice is close to a tie |
+| C-index (Uno) on test | 0.658: in 66% of comparable pairs the model correctly identifies which drone fails first (Cox: 0.665) |
+| Integrated Brier score on test | 0.175 versus 0.25 for a 50/50 forecast (Cox: 0.171) |
+| Drones in service in the test set | 500: 2 high, 92 medium and 406 low maintenance priority |
 
 **What this means for the business.**
 
 - The model ranks drones by risk with confidence. The "who to maintain first" list is clearly better than random.
-- Failure probabilities are calibrated at fleet level. Cox's mean predicted survival curve stays inside the 95% confidence interval of the observed curve over the whole informative range. So aggregate forecasts can be used to plan spare parts and the maintenance budget. A correction for hidden differences between drones removes most of the overstated risk of the riskiest drones (see [Models](#models-cox-and-aft)).
-- Cox and AFT rank drones equally well. Cox is more accurate in probabilities (IBS, p = 0.048), which does not pass the strict threshold for four metrics.
-- The fleet failure rate (hazard) is roughly flat at about 0.18 failures per 100 flight hours: roughly 16% of the drones still flying fail within each next 100 h, whatever their age. The likely reason is that wear-out of motors and batteries and early electronics failures offset each other at fleet level. So replacing drones just because they are old buys little; maintenance should be targeted by each drone's risk factors. Cox follows this rate (inside its uncertainty band, on average 7% lower); AFT's log-normal shape makes it fall with age, too high for young drones and too low for old ones.
-- The strongest risk factors in the model are temperature, humidity, battery wear at commissioning, firmware version and operating environment. These are **associations** learned by the model, not proven causes (see [Limitations](#limitations-and-assumptions)).
+- Failure probabilities are calibrated at fleet level, more closely by Cox than by AFT. Cox's mean predicted survival curve stays inside the 95% confidence interval of the observed curve over the whole informative range (21-385 h); AFT's does on 88% of it (it is 3.5 pp too pessimistic at 256 h). Aggregate forecasts can be used to plan spare parts and the maintenance budget, with Cox as the cross-check. A correction for hidden differences between drones removes most of the overstated risk of the riskiest drones in Cox (see [Models](#models-cox-and-aft)); AFT does not need it.
+- Cox and AFT rank drones equally well (p from 0.08 to 0.27). Cox is slightly more accurate in probabilities (IBS 0.171 against 0.175, p = 0.018), which does not pass the strict threshold for four metrics. The model was chosen on validation, where the two differ by 0.0004 IBS, so treat the choice as a tie and look at both.
+- The fleet failure rate (hazard) is roughly flat at about 0.18 failures per 100 flight hours: roughly 16% of the drones still flying fail within each next 100 h, whatever their age. The likely reason is that wear-out of motors and batteries and early electronics failures offset each other at fleet level. So replacing drones just because they are old buys little; maintenance should be targeted by each drone's risk factors. Cox follows this rate (inside its uncertainty band on 98% of the range, on average 9% lower); AFT's log-logistic shape lets the hazard fall with age: it stays inside the band on 72% of the range and predicts 13.0% failures in the next 100 h for drones that survived 348 h against an observed 17.1%.
+- The strongest risk factors differ between the models. In Cox they are temperature, humidity, battery wear at commissioning, firmware version and operating environment. In AFT, hard landings carry 57% of the total influence, followed by temperature, humidity and firmware. These are **associations** learned by the model, not proven causes (see [Limitations](#limitations-and-assumptions)); where the models disagree, do not act on a single factor ranking.
 
 ---
 
@@ -160,23 +160,23 @@ Both models are XGBoost gradient boosting with loss functions designed for censo
 | | Cox (`survival:cox`) | AFT (`survival:aft`) |
 |---|---|---|
 | What it predicts | How many times the drone's hazard is above average | How much the drone's lifetime is "stretched" or "compressed" |
-| Curve shape | A shared baseline hazard (Breslow estimator); each drone gets a power of it. Curves of different drones never cross | A parametric time distribution (log-normal, log-logistic or Weibull, chosen by tuning) shifted for each drone |
+| Curve shape | A shared baseline hazard (Breslow estimator); each drone gets a power of it. Curves of different drones never cross | A parametric time distribution (log-normal, log-logistic or Weibull, chosen by tuning; log-logistic in the current run) shifted for each drone |
 | Strength | Imposes no distribution shape | Can forecast beyond the observed times |
 | Weakness | The baseline is flat after the last training failure, so forecasts beyond that point are optimistic | If the real distribution has a different shape, probabilities are biased |
 
 **Hyper-parameter tuning:**
 
-- Optuna, 20 trials per model; for AFT the search includes the time distribution;
+- Optuna, 60 trials per model; for AFT the search includes the time distribution;
 - the objective is the Integrated Brier score on validation, i.e. probability accuracy, not just ranking;
 - early stopping after 50 iterations without validation improvement.
 
 **Recalibration for hidden differences between drones.** Drones with the same features still differ in durability. The weaker ones fail first, so the survivors of a high-risk group are sturdier than their features suggest. Cox assumes a constant risk ratio between drones and therefore overstates the risk of risky drones that have already flown a long time. `Model.calibrate` corrects the cumulative hazard $H$ to $\log(1 + v \cdot k \cdot H) / v$, where $v$ is the variance of the hidden durability (gamma frailty). It changes the probabilities and the remaining life, not the order of drones.
 
 - The two parameters are fitted on the training set by five-fold cross-fitting: each drone is predicted by a model that did not see it.
-- A model keeps the correction only if $v > 0$. In the current run $v = 0.27$ for Cox. For AFT $v = 0$: its log-normal hazard already falls with age, so AFT is used as trained.
-- Effect on Cox for the 500 drones in service, checked against the generator's true probabilities: the error (RMSE) of P(failure in 100 h) falls from 8.3 to 5.5 pp, and the expected remaining life goes from 481 to 538 h against a true 536 h.
+- A model keeps the correction only if $v > 0$. In the current run $v = 0.29$ for Cox. For AFT $v = 0$: its log-logistic hazard already falls with age, so AFT is used as trained.
+- Effect on Cox for the 500 drones in service, checked against the generator's true probabilities: the error (RMSE) of P(failure in 100 h) falls from 7.6 to 5.3 pp, and the expected remaining life goes from 494 to 557 h against a true 536 h (the correction slightly overshoots here).
 
-**Choosing the best model:** by validation IBS. The test set plays no part in the choice.
+**Choosing the best model:** by validation IBS (AFT 0.1519, Cox 0.1524). The test set plays no part in the choice, and on test Cox is slightly ahead, which is why the difference should not be over-read.
 
 ---
 
@@ -196,21 +196,21 @@ Uno's C-index, AUC(t) and the Brier score use one set of time points for validat
 
 - **Brier score BS(t)**: mean squared error of the forecast "the drone still works at time $t$". 0 is perfect, 0.25 is a useless 50/50 forecast.
 - **Integrated Brier score (IBS)**: the Brier score averaged over time. The main model-selection metric.
-- **Calibration**: drones are split into 10 groups by forecast, and in each group the forecast is compared with the observed KM estimate. If the model says "70% will survive to 119 h", about 70% should. The check uses three horizons (quartiles of test flight hours). At 119 h the mean error is 3.7 pp for Cox and 5.8 pp for AFT.
+- **Calibration**: drones are split into 10 groups by forecast, and in each group the forecast is compared with the observed KM estimate. If the model says "70% will survive to 119 h", about 70% should. The check uses three horizons (quartiles of test flight hours). At 119 h the mean error is 3.7 pp for Cox and 4.4 pp for AFT.
 - **Mean curve versus Kaplan-Meier**: calibration at the level of the whole fleet.
-- **Hazard versus the observed failure rate**: the model's fleet hazard $\sum_i S_i(t) h_i(t) / \sum_i S_i(t)$ against the kernel-smoothed Nelson-Aalen estimate with its 95% band (Epanechnikov kernel, bandwidth by Silverman's rule, 42 h in the current run). It is stricter than the survival curve: $S(t)$ accumulates errors over time, the hazard shows them where they happen. Cox stays inside the band on 99% of the range; AFT on 50%, because its log-normal hazard peaks early and then falls while the observed rate stays flat.
+- **Hazard versus the observed failure rate**: the model's fleet hazard $\sum_i S_i(t) h_i(t) / \sum_i S_i(t)$ against the kernel-smoothed Nelson-Aalen estimate with its 95% band (Epanechnikov kernel, bandwidth by Silverman's rule, 42 h in the current run). It is stricter than the survival curve: $S(t)$ accumulates errors over time, the hazard shows them where they happen. Cox stays inside the band on 98% of the range; AFT on 72%, because its log-logistic hazard peaks early and then falls while the observed rate stays flat.
 
 ### 3. Robustness: "is the difference between models due to chance?"
 
 **Paired bootstrap**: the test set is resampled 1000 times, and **both** models are scored on the same drones. For each metric this gives a 95% confidence interval of the difference. If the interval does not contain 0, the difference is significant. With four metrics, a strict conclusion requires $p < 0.0125$ (Bonferroni correction).
 
-Current result: the ranking metrics do not differ (p from 0.29 to 0.94). Cox has the lower IBS (0.171 against 0.175, p = 0.048): significant on its own, not after the correction for four metrics.
+Current result: the ranking metrics do not differ (p from 0.08 to 0.27). Cox has the lower IBS (0.171 against 0.175, p = 0.018): significant on its own, not after the correction for four metrics.
 
 ### 4. Remaining-life backtest
 
 Take the test drones that survived to 119 h (the landmark). For them, compare the conditional survival predicted by the model with the observed KM curve of remaining life. This directly checks what maintenance relies on: the forecast of "how much longer will a drone that has already flown $a$ hours keep flying".
 
-The check is repeated inside each fifth of the predicted P(failure in 100 h), the quantity behind the maintenance priority (notebook and the "Fleet" tab). In the current run Cox's forecast lies inside the 95% interval of the observed share in all five fifths. In the riskiest fifth it predicts 32% against an observed 30.5%; before the recalibration it predicted 36.5%.
+The check is repeated inside each fifth of the predicted P(failure in 100 h), the quantity behind the maintenance priority (notebook and the "Fleet" tab). In the current run Cox's forecast lies inside the 95% interval of the observed share in all five fifths: in the riskiest it predicts 31% against an observed 28% (35% before the recalibration). AFT, the selected model, lies inside in four fifths; in the riskiest it predicts 35% against an observed 25% (95% interval 18-33%), i.e. it overstates the risk of the riskiest drones in this backtest.
 
 ---
 
@@ -225,7 +225,7 @@ For each drone **in service** (a test drone still flying at the data cut-off) wi
 | **Median remaining life** | The drone works longer than this with 50% probability | Typical expected life |
 | **Expected remaining life** | Mean remaining life within the horizon (1111 h) | Fleet capacity planning |
 
-**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\thinspace dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; Cox predicts 17.4%, 14.4%, 16.1% and 15.9%. So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
+**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\thinspace dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; Cox predicts 17.3%, 14.4%, 15.9% and 15.5%, AFT 18.3%, 16.8%, 14.9% and 13.0% (it falls with age, which the data do not show). So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
 
 **Maintenance priority:**
 
@@ -251,7 +251,7 @@ The **risk group** (Low / Medium / High) is the tercile of the risk score across
 
 Cox and AFT importances are compared as **shares**, not absolute values: Cox contributions are on the log hazard ratio scale, AFT contributions on the log time scale.
 
-**"What if" scenario** (the "Drone card" tab): change a drone's features (lower the payload, update the firmware, change the environment) and see how the failure probability and remaining life change. Example on the current artifacts: for DR-002709, lowering average humidity from 86% to 50% reduces P(failure in 100 h) from 54% to 45%, moves the drone from high to medium priority and increases the median remaining life from 91 to 114 h.
+**"What if" scenario** (the "Drone card" tab): change a drone's features (lower the payload, update the firmware, change the environment) and see how the failure probability and remaining life change. Example on the current artifacts: for DR-002709, lowering average humidity from 86% to 50% changes P(failure in 100 h) from 26.8% to 26.4% in AFT (the selected model) but from 45.8% to 37.2% in Cox, with the median remaining life going from 113 to 154 h. The models disagree both on the level and on how much humidity matters, which is the reason to read what-if results from both before acting.
 
 > SHAP and "what if" explain the **model**, not the physics of failure. If a factor only correlates with the real cause, the model attributes the effect to it. Before management decisions ("let's move the whole fleet to firmware 5"), check the conclusions with engineers or a pilot experiment.
 
@@ -291,7 +291,7 @@ The "Score new drones" tab in both dashboards forecasts drones from your own CSV
 5. **All failure types are combined.** The model forecasts "the first critical failure of any type". Planning spare parts by type (batteries separately from motors) needs a competing-risks analysis.
 6. **Drones in service** are the censored test drones whose flight log reaches the data cut-off: commissioning date plus flight hours divided by daily utilisation. Censored drones last seen earlier (53 of 553 in the current run) are treated as having left the fleet and get no forecast. This relies on `daily_utilization_h` being the average over the whole service period; on a real fleet use the operator's status field instead.
 7. **The remaining-life horizon** is limited by the last failure in training (1111 h). Beyond it Cox cannot estimate how the hazard grows. The far end of the Cox baseline rests on few training drones (20 still flying at 1761 h, 4 at 2348 h), so long-horizon figures for the oldest drones are noisy.
-8. **The near-term risk of the riskiest drones is still somewhat overstated.** The recalibration (see [Models](#models-cox-and-aft)) removes most of the effect, not all of it. Against the generator's true probabilities, the riskiest fifth of drones in service is forecast at 32% against a true 28% (40% before the recalibration), and the six high-priority drones at 57% against a true 45%. Treat the high-priority list as a ranking of who to inspect first and its probabilities as an upper estimate. On a real fleet this check is only possible through the [backtest](#4-remaining-life-backtest) by risk group, whose intervals are wide.
+8. **The near-term risk of the riskiest drones is somewhat overstated.** Against the generator's true probabilities, the two high-priority drones are forecast at 61% against a true 53% (AFT, the selected model), and the riskiest fifth of drones in service at 26.9% against a true 26.5%. Cox without the recalibration forecasts the riskiest fifth at 37.5% against 28.2%; with it, 29.7%. In the landmark [backtest](#4-remaining-life-backtest) the selected AFT overstates its riskiest fifth (35% against an observed 25%). Treat the high-priority list as a ranking of who to inspect first and its probabilities as an upper estimate. On a real fleet only the backtest is available, and its intervals are wide.
 9. **The split is by cohort, not by calendar time.** Training drones are followed up to the data cut-off, i.e. after the test drones were commissioned. Nothing in these data depends on calendar time, so it does no harm here; with seasonal or fleet-wide effects it would leak the future into training.
 10. **Correlation, not causation.** See the SHAP section.
 
@@ -306,10 +306,10 @@ The forecast is probabilistic. 60% in 100 h means that of 100 identical drones i
 The risk group is how risky the drone's characteristics are relative to the others, regardless of flight hours. The maintenance priority is how likely a failure is **in the next 100 h**, given the hours already flown. A high-risk-group drone with few flight hours can have medium priority, and vice versa.
 
 **Why is test quality lower than validation quality?**
-Both sets are scored on the same time points, so the gap is real: C-index (Uno) goes from 0.717 to 0.665 and IBS from 0.153 to 0.171. Validation is optimistic because the hyper-parameters, early stopping and the choice of model all used it, and with 500 drones its estimates are also noisier. Quote the test figures.
+Both sets are scored on the same time points, so the gap is real: C-index (Uno) goes from 0.719 to 0.658 and IBS from 0.152 to 0.175 for AFT (Cox: 0.718 to 0.665 and 0.152 to 0.171). Validation is optimistic because the hyper-parameters, early stopping and the choice of model all used it, and with 500 drones its estimates are also noisier. Quote the test figures.
 
-**Why was Cox chosen if AFT is better on some metrics?**
-The model is chosen by probability accuracy (IBS) on validation, in advance and without looking at the test set. On test the two models rank drones equally well and Cox is also ahead on IBS, so the choice holds up.
+**Why was AFT chosen if Cox is better on test?**
+The model is chosen by probability accuracy (IBS) on validation, in advance and without looking at the test set. There AFT leads by 0.0004, well inside the noise. On test Cox is ahead on IBS (0.171 against 0.175, p = 0.018, not significant after the correction for four metrics) and its fleet-level calibration and hazard fit are better, while the ranking is equal. Selecting by test would leak the test set, so the rule stays; read the Cox column as a cross-check. If you prefer Cox as the primary model, set `best_name = "cox"` in the notebook and re-run the cells after it.
 
 **Can I trust an "expected remaining life" of 900+ h?**
 With caution. The further the horizon, the less data supports it. For planning, "life until 10% risk" and P(failure in 100 h) are more reliable.
@@ -317,8 +317,8 @@ With caution. The further the horizon, the less data supports it. For planning, 
 **How often should the model be retrained?**
 When new failures accumulate, especially at high flight hours: they extend the forecast horizon. Also after fleet changes (new drone models, firmware, regions). A sign of ageing is worsening calibration in a backtest on fresh data.
 
-**Is a C-index of 0.67 good?**
-For two randomly chosen drones, one of which failed earlier, the model points to it correctly in 67% of cases (random guessing gives 50%). For equipment failures with a lot of individual randomness this is a working level. Perfection is unattainable here, because part of the variation is not explained by any feature.
+**Is a C-index of 0.66 good?**
+For two randomly chosen drones, one of which failed earlier, the model points to it correctly in 66% of cases (random guessing gives 50%). For equipment failures with a lot of individual randomness this is a working level. Perfection is unattainable here, because part of the variation is not explained by any feature.
 
 **Can I score drones that are not in the data?**
 Yes: use the "Score new drones" tab (see [Scoring new drones](#scoring-new-drones)). Keep feature values within the training ranges for reliable forecasts.
@@ -351,18 +351,43 @@ The `data/`, `models/` and `artifacts/` directories are not stored in git and ar
 
 Generator parameters (number of drones, effect strength, hidden frailty, etc.) are listed by `uv run python generate_drone_survival.py --help`.
 
+### Training and scoring studio (Docker)
+
+A separate Streamlit app, `trainer/app.py`, trains the models on **your own CSV** and scores other files with them. It runs the same steps with the same defaults as `drone_survival.ipynb` (time split, Optuna tuning with 60 trials per model, frailty recalibration, bootstrap, SHAP, remaining life), and writes the same files, so a finished run can be read by the dashboards above.
+
+```bash
+docker compose build
+docker compose up        # http://localhost:8501
+```
+
+| Tab | What it does |
+|---|---|
+| Data | Upload the training CSV; the schema is checked (see below) and a summary and split sizes are shown |
+| Train | Choose Optuna trials and bootstrap replicates, start training; it runs in the background with a progress log and can be cancelled between stages |
+| Runs | All runs with state, best model and test metrics; select the active run or delete one |
+| Results | Metrics, calibration, bootstrap, SHAP importance and the fleet queue of the active run |
+| Score | Upload any CSV in the "Scoring new drones" format and score it with Cox or AFT of the active run (default: the run's best); download the result |
+
+**Training CSV.** One row per drone with `drone_id` (unique), `commission_date`, `duration_h` (> 0), `event` (0 or 1), the 16 features from [Data](#data) (`daily_utilization_h` must be positive and non-empty), and optionally `failure_mode`. At least 500 drones are required, with enough failures in each split. A bad file is rejected with the reason; the "Download an empty template" button gives the header.
+
+**Storage.** Each run lives in the volume `studio_runs` mounted at `/app/runs` (`<run_id>/status.json`, `artifacts/`, `models/`), so runs survive container restarts and are not stored in git. A run left "running" by a stopped container is marked failed on the next start. The training CSV itself is not kept, only its row count and a short hash. One training job runs at a time.
+
+**Equivalence with the notebook.** On `data/drone_survival.csv` with the default settings the studio gives metrics identical to `artifacts/metrics.parquet` and the same priority counts. The notebook remains the reference; the studio is a second implementation of the same steps in `trainer/pipeline.py`.
+
+**Limits.** The input schema is fixed to the 16 drone features. Models are trained in the app process on CPU; a full run on 5000 drones takes about a minute on a laptop. The image is built in two stages from `python:3.13-slim` (the builder has a compiler for `ecos` and `scikit-survival`, which have no wheels on Linux aarch64; the final image has none) and installs the dependencies from `uv.lock`; the container runs as an unprivileged user. Do not expose the port to untrusted users: the app has no authentication.
+
 ### Dashboard
 
-Both dashboards show the same content. Each step comes with "What is shown", "How to read it" and "What the data shows" blocks: the findings are generated automatically from the current artifacts.
+Both dashboards show the same content and have an English/Russian language switch (the choice keeps the open tab). Each step comes with "What is shown", "How to read it" and "What the data shows" blocks: the findings are generated automatically from the current artifacts.
 
 | Tab | Content |
 |---|---|
-| Overview | Key numbers, main findings, fleet survival curve, failure cause structure, observed failure rate (hazard) by flight hours |
+| Overview | Key numbers, queue size at alternative high-priority thresholds (30/40/50%), main findings, fleet survival curve, failure cause structure and timing, observed failure rate (hazard) by flight hours |
 | Methodology | Analysis steps, tuned hyper-parameters, feature dictionary with ranges, glossary |
 | Failure segments | Kaplan-Meier curves and log-rank test by drone model, environment, firmware, refurbished drones, risk group and maintenance priority; failure structure and statistics by segment |
-| Model quality | Metrics, learning curves, predicted vs observed survival and failure rate, Brier and AUC over time, calibration, bootstrap |
+| Model quality | Metrics, learning curves, predicted vs observed survival and failure rate (plus the five drones on which Cox and AFT disagree most), Brier and AUC over time, calibration, bootstrap |
 | Risk factors | Feature importance, SHAP point cloud, dependence plots |
-| Fleet | Table of drones in service with maintenance priority, filters, link to the drone card; backtest of the forecast, overall and by risk group |
+| Fleet | Table of drones in service with maintenance priority, filters, CSV download and link to the drone card; hours flown against failure probability; remaining-life histogram and curves of the riskiest drones; backtest of the forecast, overall and by risk group |
 | Drone card | Remaining-life forecast, the drone's failure rate by flight hours, SHAP breakdown of the risk, "what if" scenario |
 | Score new drones | CSV template, upload, validation, forecasts for each drone and CSV download |
 
@@ -373,14 +398,23 @@ Both dashboards show the same content. Each step comes with "What is shown", "Ho
 ```
 generate_drone_survival.py   synthetic data generator
 drone_survival.ipynb         training, evaluation, explanation, remaining life, artifacts
+predict_drone.ipynb          scoring one drone with the saved model
+debug_predictions.ipynb      hand-made recomputation of one drone's forecast, step by step,
+                             checked against the library (debug_predictions_RU.ipynb: Russian)
 utils.py                     Model (Cox/AFT on XGBoost, recalibration), tune, evaluation_times, evaluate,
                              calibration_curve, bootstrap_compare, remaining_life
+trainer/
+  pipeline.py                the notebook's training steps as a function (validation, train, artifacts)
+  runs.py                    run registry, background training job
+  app.py                     Streamlit studio: train on a CSV, score other files
+Dockerfile, docker-compose.yml   container for the studio (volume with runs)
 dashboard/
   data.py                    loading and checking the artifacts
   common.py                  logic shared by both dashboards, including CSV scoring
   figures.py                 Plotly charts
   insights.py                automatic text findings
-  texts.py, labels.py        explanations and display labels
+  locale/                    English and Russian catalogs (checked to have the same structure)
+  texts.py, labels.py        English re-exports of the catalog for display names and explanations
   app.py                     Dash dashboard
   streamlit_app.py           Streamlit dashboard
 ```

@@ -1,0 +1,17 @@
+.git
+.venv
+.ruff_cache
+.streamlit
+.agents
+.claude
+__pycache__
+**/__pycache__
+data
+models
+artifacts
+runs
+*.ipynb
+*.md
+generate_drone_survival.py
+docker-compose.yml
+Dockerfile

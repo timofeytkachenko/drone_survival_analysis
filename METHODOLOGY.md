@@ -17,6 +17,7 @@ Technical reference for everything implemented in this repository: the data-gene
 11. [Remaining useful life and maintenance priority](#11-remaining-useful-life-and-maintenance-priority)
 12. [Artifacts](#12-artifacts)
 13. [Dashboards](#13-dashboards)
+    - [13a. Training and scoring studio](#13a-training-and-scoring-studio)
 14. [Modelling caveats](#14-modelling-caveats)
 15. [Reference results](#15-reference-results)
 
@@ -45,7 +46,9 @@ Code layout:
 - `generate_drone_survival.py`: synthetic data with a known ground truth.
 - `utils.py`: modelling library (`Model`, `tune`, metrics, bootstrap, calibration, hazard, RUL).
 - `drone_survival.ipynb`: the end-to-end analysis; the only producer of models and artifacts.
-- `dashboard/`: `data.py` (artifact loading and validation), `common.py` (shared logic of both apps: KPIs, fleet table, drone card, what-if, CSV scoring), `figures.py` (Plotly charts), `insights.py` (auto-generated text findings), `texts.py` and `labels.py` (explanations and display names), `app.py` and `streamlit_app.py` (the two UIs).
+- `predict_drone.ipynb`: scoring one drone with the saved model. `debug_predictions.ipynb` (Russian: `debug_predictions_RU.ipynb`): recomputes one drone's forecast by hand, step by step, and compares each intermediate with the library; use it when a number or a curve looks wrong.
+- `trainer/`: the training and scoring studio (section 13a): `pipeline.py`, `runs.py`, `app.py`; with `Dockerfile` and `docker-compose.yml` it runs in a container.
+- `dashboard/`: `data.py` (artifact loading and validation), `common.py` (shared logic of both apps: KPIs, fleet table, drone card, what-if, CSV scoring), `figures.py` (Plotly charts), `insights.py` (auto-generated text findings), `locale/` (English and Russian catalogs with all display strings; loading fails if the two differ in structure or placeholders), `texts.py` and `labels.py` (English re-exports of the catalog), `app.py` and `streamlit_app.py` (the two UIs).
 
 ---
 
@@ -222,7 +225,7 @@ For `normal`, $H'$ is computed as `exp(logpdf − logsf)` to stay finite deep in
 
 ## 6. Hyper-parameter tuning
 
-`utils.tune`: Optuna, TPE sampler (seed 42), 20 trials per model. Search space:
+`utils.tune`: Optuna, TPE sampler (seed 42), 60 trials per model (`N_TRIALS` in the notebook). Search space:
 
 - `max_depth` 2–5; `eta` 0.025–0.15 (log); `min_child_weight` 1–30 (log);
 - `subsample`, `colsample_bytree` 0.7–1.0; `reg_lambda` 0.1–20 (log);
@@ -240,7 +243,7 @@ The validation set is therefore used three times: early stopping, tuning and mod
 
 ### 7.1 Why
 
-Drones with identical features still differ in durability (the shared frailty in section 2.1). The weaker drones of a high-risk group fail first, so the survivors become, on average, sturdier than their features suggest. A Cox model assumes a constant hazard ratio between drones at every age, so it **overstates the hazard of high-risk drones at later ages**, exactly the drones that drive maintenance priority. Before the correction, the landmark backtest showed this: in the riskiest fifth of drones the model predicted 36.5% failures in 100 h against an observed 30.5%.
+Drones with identical features still differ in durability (the shared frailty in section 2.1). The weaker drones of a high-risk group fail first, so the survivors become, on average, sturdier than their features suggest. A Cox model assumes a constant hazard ratio between drones at every age, so it **overstates the hazard of high-risk drones at later ages**, exactly the drones that drive maintenance priority. Before the correction, the landmark backtest showed this: in the riskiest fifth of drones Cox predicted 35.1% failures in 100 h against an observed 28.4%.
 
 ### 7.2 Gamma-frailty link
 
@@ -273,10 +276,10 @@ $H_i$ must not be in-sample: a model evaluated on the drones it was trained on h
 
 The notebook keeps the correction only if the fitted $v > 0$. With $v = 0$ the link is a plain rescaling $kH$, which is not what this step is for.
 
-- **Cox**: $v = 0.267$, $k = 1.05$ (the generator's true variance is 0.3). Applied.
-- **AFT**: $v = 0$, $k = 1.06$. Not applied. Its log-normal hazard already falls with age, which mimics the frailty effect; the pure rescaling made its test IBS worse (0.1749 → 0.1764).
+- **Cox**: $v = 0.289$, $k = 1.052$ (the generator's true variance is 0.3). Applied.
+- **AFT**: $v = 0$, $k = 1.033$. Not applied. Its tuned log-logistic hazard already falls with age, which mimics the frailty effect; the pure rescaling made its test IBS slightly worse (0.1754 → 0.1760).
 
-A landmark Poisson recalibration of the 100-hour failure probability alone was also considered and rejected: against the generator's true probabilities it was less accurate (RMSE 6.9 pp vs 5.5 pp) and it would have made `p_fail_window` inconsistent with the rest of the curve (median RUL, RMRL).
+A landmark Poisson recalibration of the 100-hour failure probability alone was also considered and rejected: against the generator's true probabilities it was less accurate (RMSE 6.9 pp vs 5.5 pp, measured in an earlier run with the same generator and a different tuning; not repeated) and it would have made `p_fail_window` inconsistent with the rest of the curve (median RUL, RMRL).
 
 ---
 
@@ -356,7 +359,7 @@ Notebook 7.1; "Fleet" tab. Ages $a \in \lbrace 0, Q_{25}, Q_{50}, Q_{75} \rbrace
 Notebook 7.2; "Fleet" tab. Landmark $L = Q_{25}$ of test durations. Drones with $T > L$ form the at-risk group; their residual life $T - L$ (with the same event flags) is the observed outcome, and every one of them is predicted with $S(L + u \mid x)/S(L \mid x)$.
 
 - **Whole group** (left chart): mean predicted conditional survival vs Kaplan-Meier of residual life with its band.
-- **By risk group** (right chart, table `backtest_groups`): drones are split into quintiles of the predicted probability of failing within 100 h after $L$, the quantity behind the maintenance priority. In each quintile the mean prediction is compared with the Kaplan-Meier failure share at 100 h and its log-log 95% interval. Points below the diagonal mean the risk is overstated. The best model is drawn with error bars; if it is calibrated, a grey dashed line ("raw") shows the same model before the recalibration of section 7.
+- **By risk group** (right chart, table `backtest_groups`): drones are split into quintiles of the predicted probability of failing within 100 h after $L$, the quantity behind the maintenance priority. In each quintile the mean prediction is compared with the Kaplan-Meier failure share at 100 h and its log-log 95% interval. Points below the diagonal mean the risk is overstated. The best model is drawn with error bars; if it was recalibrated, a grey dashed line ("raw") shows the same model before the recalibration of section 7. The line is drawn only for a recalibrated best model, so it is absent when AFT is the best model (the current run); `backtest_groups` then holds the Cox and AFT rows.
 
 This checks the conditional forecasts on drones that actually survived to $L$. It is not an out-of-time backtest: features are fixed and the outcomes come from the same test cohort, observed after $L$.
 
@@ -414,16 +417,16 @@ Written by notebook section 8 into `artifacts/` (parquet unless stated); the das
 
 ## 13. Dashboards
 
-Dash (`dashboard/app.py`, port 8050) and Streamlit (`dashboard/streamlit_app.py`) share all logic in `common.py`, `figures.py`, `insights.py` and `texts.py`, so they show the same numbers. Every chart has a "what it shows / how to read it / details" explanation and auto-generated findings computed from the artifacts.
+Dash (`dashboard/app.py`, port 8050) and Streamlit (`dashboard/streamlit_app.py`) share all logic in `common.py`, `figures.py`, `insights.py` and the `locale` catalogs, so they show the same numbers. Both have an English/Russian switch that keeps the open tab; data values (priority codes, feature names, failure modes) stay in English and only their captions are translated. Every chart has a "what it shows / how to read it / details" explanation and auto-generated findings computed from the artifacts.
 
 | Tab | Content |
 |---|---|
-| Overview | KPIs, key findings, Kaplan-Meier of the test fleet, fleet hazard, failure-mode breakdown |
+| Overview | KPIs, queue size at high-priority thresholds of 30/40/50%, key findings, Kaplan-Meier of the test fleet, fleet hazard, failure-mode breakdown and timing |
 | Methodology | survival-analysis concepts, pipeline steps, features, hyper-parameters (including the recalibration parameters) |
 | Failure segments | Kaplan-Meier and failure-mode structure by segment (drone model, environment, firmware, refurbished, risk group, maintenance priority) |
-| Model quality | training curves, mean curve vs Kaplan-Meier, individual curves, hazard fit, metrics table, Brier(t), AUC(t), calibration with horizon selector, bootstrap |
+| Model quality | training curves, mean curve vs Kaplan-Meier, individual curves (the five drones where Cox and AFT disagree most), hazard fit, metrics table, Brier(t), AUC(t), calibration with horizon selector, bootstrap |
 | Risk factors | SHAP importance, beeswarm and dependence with model selector |
-| Fleet | drones in service with priority and filters; landmark backtest overall and by risk group; conditional curves of the riskiest drones; median-RUL histogram |
+| Fleet | drones in service with priority, filters and CSV download; hours flown against failure probability; landmark backtest overall and by risk group; conditional curves of the riskiest drones; median-RUL histogram |
 | Drone card | status, forecast metrics, conditional survival and hazard, SHAP waterfall, "what if" scenario |
 | Score new drones | CSV upload, template download, forecast table |
 
@@ -440,49 +443,73 @@ Dash (`dashboard/app.py`, port 8050) and Streamlit (`dashboard/streamlit_app.py`
 
 ---
 
+## 13a. Training and scoring studio
+
+`trainer/` is a second entry point that runs the notebook pipeline on an uploaded CSV and keeps the result as a *run*.
+
+- `trainer/pipeline.py`: `prepare_frame` validates the table (required columns, parseable dates, `event` in {0, 1}, positive `duration_h` and `daily_utilization_h`, unique `drone_id`, at least 500 drones and 30 / 10 / 10 failures in train / validation / test, a positive remaining-life horizon) and derives `in_service` as in section 2.3; `train` repeats notebook sections 2-8 with the same parameters (split quantiles 0.70 and 0.80, `tune` with 60 trials by default, `Model.calibrate` and the $v > 0$ rule, evaluation grid, paired bootstrap with seed 42, SHAP, landmark backtest, RUL, priorities) and writes the artifacts of section 12 plus `meta.json`.
+- `trainer/runs.py`: `RUNS_DIR/<run_id>/` holds `status.json` (state, stage, progress log, settings, source file name, row count, a hash of the data, test metrics) and, after success, `artifacts/` and `models/`. Training happens in `work/` and is moved into place only on success. Run ids are generated and checked to stay inside `RUNS_DIR`. One job at a time; a stale `running` state after a container stop becomes `failed`.
+- `trainer/app.py`: Streamlit UI (Data, Train, Runs, Results, Score; English and Russian) built on `dashboard.data.load`, `common.score_upload`, `figures` and `insights`, so scoring validation, `out_of_range` flags and priorities are identical to the dashboards. The Score tab can use either model of the run; the risk groups are terciles of the chosen model's test risk.
+- Docker: `Dockerfile` (python:3.13-slim, `uv sync --frozen --no-dev`, non-root user) and `docker-compose.yml` (port 8501, volume `studio_runs` at `/app/runs`).
+
+Check: on `data/drone_survival.csv` with default settings the studio reproduces `artifacts/metrics.parquet` exactly and scoring the template reproduces the notebook's `p_fail_window`. The Docker image was built and run on Linux aarch64: health check passed, a run trained inside the container and was still listed after a container restart. On this platform `ecos` and `scikit-survival` have no wheels and are compiled in the builder stage (about 35 s with the layer cache cold, apart from downloads); the final image carries no compiler. Not tested: linux/amd64 builds and the browser UI inside the container.
+
+Caveats: the schema is fixed; the model choice, thresholds and horizons follow the notebook and cannot be changed in the UI; cancellation takes effect between stages, not inside a tuning stage; the app has no authentication.
+
+---
+
 ## 14. Modelling caveats
 
 1. **Synthetic data.** All conclusions hold for the generator's assumptions: fixed covariates, Weibull mechanisms, shared gamma frailty, independent censoring. On a real fleet, check them before trusting probabilities.
 2. **Time-fixed features.** Wear, firmware updates and changes in environment are not modelled; conditional survival assumes today's features are those at commissioning.
 3. **Competing risks are pooled.** The models forecast "any critical failure". Cause-specific forecasts (cause-specific hazards or Fine-Gray) are not implemented; `failure_mode` is descriptive only.
 4. **Cox baseline support.** $\hat H_0$ is flat after the last training failure; the RUL horizon is capped, and uploaded ages above the test fleet range are flagged.
-5. **Residual overstatement for the riskiest drones.** The recalibration removes most of it, not all. Against the generator's truth (section 15), the six high-priority drones are forecast at 57% vs a true 45%. Use the high-priority list as a ranking and its probabilities as an upper estimate.
+5. **Residual overstatement for the riskiest drones.** Against the generator's truth (section 15), the two high-priority drones of the selected AFT model are forecast at 61% vs a true 53%, and AFT's expected remaining life is 621 h vs a true 536 h. Cox's recalibration removes most of its overstatement (riskiest fifth 37.5% → 29.7% vs a true 28.2%) but then overshoots the expected remaining life (557 h). Use the high-priority list as a ranking and its probabilities as an upper estimate.
 6. **IPCW independence.** Administrative censoring depends on `daily_utilization_h`, so IPCW-based metrics are approximate.
 7. **Optimistic validation.** Validation was used for early stopping, tuning, model choice and the fold refits' early stopping; quote test metrics.
 8. **Bootstrap scope.** Intervals reflect test-sample noise with fixed models, not retraining variability.
 9. **Kernel edge bias.** Smoothed hazards (observed and Cox) are biased downwards within one bandwidth of 0 and of the last event.
 10. **Calibration bins.** Decile calibration uses the bin's last Kaplan-Meier value when follow-up ends before the horizon.
 11. **Cohort split.** Harmless here because nothing depends on calendar time; with calendar effects it would leak.
-12. **Small groups.** The quintile backtest has 150 drones per group; its 95% intervals are wide (23–39% around an observed 30.5% in the top group).
+12. **Small groups.** The quintile backtest has 150 drones per group; its 95% intervals are wide (top group: 22–37% around an observed 28.4% for Cox, 18–33% around 24.9% for AFT).
 
 ---
 
 ## 15. Reference results
 
-From the last full run of the current code (5000 drones, seed 42). A re-run reproduces them up to library-level non-determinism.
+From the last full run of the current code (5000 drones, seed 42, `generated_at` 2026-11-15 20:41 in `meta.json`). A re-run reproduces them up to library-level non-determinism.
 
-**Recalibration**: Cox $v = 0.267$, $k = 1.050$ (applied); AFT $v = 0$, $k = 1.062$ (not applied).
+**Tuning**: 60 trials per model. Cox: depth 3, eta 0.102, best iteration 117. AFT: log-logistic, scale 0.738, depth 5, eta 0.032, best iteration 345.
+
+**Recalibration**: Cox $v = 0.289$, $k = 1.052$ (applied); AFT $v = 0$, $k = 1.033$ (not applied).
 
 **Metrics** (C-index Harrell / Uno / mean AUC / IBS):
 
-- Cox: validation 0.729 / 0.717 / 0.789 / 0.153; test 0.669 / 0.665 / 0.696 / 0.171.
-- AFT: validation 0.733 / 0.719 / 0.798 / 0.156; test 0.670 / 0.662 / 0.690 / 0.175.
-- Best model by validation IBS: Cox.
+- Cox: validation 0.730 / 0.718 / 0.788 / 0.152; test 0.672 / 0.665 / 0.700 / 0.171.
+- AFT: validation 0.733 / 0.719 / 0.797 / 0.152; test 0.666 / 0.658 / 0.687 / 0.175.
+- Best model by validation IBS: AFT (0.1519 against 0.1524 for Cox, a near tie). On test Cox is ahead on every metric.
 
-**Bootstrap (Cox − AFT, test)**: ranking metrics do not differ (p = 0.94, 0.61, 0.29); IBS −0.0039, 95% CI [−0.0077, −0.0000], p = 0.048: significant on its own, not after Bonferroni.
+**Bootstrap (Cox − AFT, test)**: ranking metrics do not differ (p = 0.27, 0.24, 0.08); IBS −0.0045, 95% CI [−0.0084, −0.0008], p = 0.018: significant on its own, not after Bonferroni.
 
-**Fit checks (Cox, test)**: fleet hazard inside the observed 95% band on 99% of the range (AFT 50%); mean curve inside the Kaplan-Meier band on 100% of the informative range (AFT 47%); mean decile calibration error at 119 h 3.7 pp (AFT 5.8 pp).
+**Fit checks (test)**: fleet hazard inside the observed 95% band on 98% of the range for Cox (AFT 72%), on average 9% below the observed rate (AFT 7%); mean curve inside the Kaplan-Meier band on 100% of the informative range up to 385 h for Cox (AFT 88%); mean decile calibration error at 119 h 3.7 pp for Cox (AFT 4.4 pp).
 
-**Conditional P(fail in 100 h)** at ages 0 / 119 / 219 / 348 h: observed 17.5% / 15.2% / 17.5% / 17.1%, Cox 17.4% / 14.4% / 16.1% / 15.9%. The fleet hazard is roughly flat at about 0.18 failures per 100 flight hours: wear-out of motors and batteries and infant mortality of electronics offset each other at fleet level.
+**Conditional P(fail in 100 h)** at ages 0 / 119 / 219 / 348 h: observed 17.5% / 15.2% / 17.5% / 17.1%, Cox 17.3% / 14.4% / 15.9% / 15.5%, AFT 18.3% / 16.8% / 14.9% / 13.0%. The fleet hazard is roughly flat at about 0.18 failures per 100 flight hours: wear-out of motors and batteries and infant mortality of electronics offset each other at fleet level. AFT's falling hazard is its imposed shape, not a feature of the data.
 
-**Quintile backtest (Cox, $L$ = 119 h)**: predicted 5.6 / 8.2 / 11.7 / 17.5 / 32.3% vs observed 6.8 / 8.1 / 14.3 / 16.4 / 30.5%, all inside the 95% intervals; before the recalibration the top quintile was 36.5%.
+**Quintile backtest ($L$ = 119 h)**, predicted vs observed failure share in 100 h:
 
-**Drones in service (test)**: 500; priority High 6, Medium 115, Low 379; RUL horizon 1111 h.
+- Cox: 6.2 / 8.6 / 11.5 / 17.0 / 30.9% vs 3.9 / 10.4 / 16.1 / 17.1 / 28.4%, all inside the 95% intervals; before the recalibration the top quintile was 35.1%.
+- AFT: 6.2 / 10.4 / 14.8 / 22.5 / 35.1% vs 5.5 / 11.1 / 10.7 / 23.4 / 24.9%; the top quintile lies above its interval (18.4–33.1%).
 
-**Oracle check against the generator** (true conditional failure probability with the known Weibull hazards and frailty variance 0.3, drones in service, Cox before → after recalibration):
+**SHAP shares of the total mean |SHAP|**: Cox, temperature 21%, humidity 11%, battery cycles 10%, firmware 9%, environment 8%; AFT, hard landings 57%, temperature 8%, humidity 6%, firmware 4%. The two models rank the factors differently.
 
-- mean P(failure in 100 h): 17.9% → 15.6% (true 14.7%);
-- RMSE of the individual probability: 8.3 → 5.5 pp;
-- riskiest fifth: 39.7% → 31.6% (true 28.3%);
-- expected remaining life within the horizon: 481 → 538 h (true 536 h);
-- expected failures in the next 100 h: 89 → 78 (true 74).
+**Drones in service (test)**: 500 (53 of the 553 censored test drones left the fleet earlier); priority High 2, Medium 92, Low 406 with AFT; at a high-priority threshold of 40% / 30% the High count is 4 / 25. RUL horizon 1111 h; 48 drones have a median remaining life beyond it.
+
+**Oracle check against the generator** (true conditional failure probability with the known Weibull hazards and frailty variance 0.3, drones in service; true mean P(failure in 100 h) 14.7%, expected failures 74, expected remaining life 536 h):
+
+| | mean P(100 h) | RMSE, pp | riskiest fifth (true) | expected failures | expected remaining life, h |
+|---|---|---|---|---|---|
+| Cox, no recalibration | 17.4% | 7.6 | 37.5% (28.2%) | 87 | 494 |
+| Cox, recalibrated | 15.0% | 5.3 | 29.7% (28.2%) | 75 | 557 |
+| AFT (selected) | 14.1% | 6.3 | 26.9% (26.5%) | 70 | 621 |
+
+The riskiest fifth is taken by each model's own ranking, so its true value differs slightly between rows. The two high-priority drones of AFT: forecast 61.3% against a true 53.2%. Rows were recomputed for this run with a scratch script that is not kept in the repository.
