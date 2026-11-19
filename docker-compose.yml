@@ -1,12 +1,74 @@
+# Studio (training, release, scoring UI) and scoring API from one image.
+# Secrets come from .env (copy .env.example); compose refuses to start without them.
+# Both ports are published on 127.0.0.1 only: put a TLS reverse proxy in front
+# before exposing either service to a network.
+
+x-service: &service
+  build: .
+  image: drone-survival-studio
+  restart: unless-stopped
+  init: true
+  # Runs, the production pointer and the scoring log; shared by both services
+  volumes:
+    - studio_runs:/app/runs
+  # Nothing but the volume and /tmp is writable
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 512
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   studio:
-    build: .
-    image: drone-survival-studio
+    <<: *service
     ports:
-      - "8501:8501"
-    volumes:
-      - studio_runs:/app/runs
-    restart: unless-stopped
+      - "127.0.0.1:8501:8501"
+    environment:
+      STUDIO_PASSWORD: ${STUDIO_PASSWORD:?set STUDIO_PASSWORD in .env, see .env.example}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+      STREAMLIT_SERVER_MAX_UPLOAD_SIZE: ${MAX_UPLOAD_MB:-20}
+      MAX_TRAIN_ROWS: ${MAX_TRAIN_ROWS:-200000}
+      MAX_SCORE_ROWS: ${MAX_SCORE_ROWS:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Release-gate limits; unset means the defaults of trainer.release.GateConfig
+      GATE_C_INDEX_TOLERANCE:
+      GATE_IBS_TOLERANCE:
+      GATE_MAX_CALIBRATION_ERROR:
+      GATE_MIN_BACKTEST_GROUPS:
+    # Training runs Optuna and XGBoost in this container
+    cpus: 4
+    mem_limit: 4g
+
+  api:
+    <<: *service
+    command: ["/app/.venv/bin/python", "-m", "trainer.api"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      API_KEY: ${API_KEY:?set API_KEY in .env, see .env.example}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+      MAX_SCORE_ROWS: ${MAX_SCORE_ROWS:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    cpus: 2
+    mem_limit: 2g
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   studio_runs:

@@ -6,6 +6,7 @@ dependencies = [
     "catboost>=1.2.10",
     "dash>=4.5.0",
     "dash-bootstrap-components>=2.0.4",
+    "fastapi>=0.165.0",
     "jupyter>=1.1.1",
     "lifelines>=0.30.0",
     "matplotlib>=3.11.2",

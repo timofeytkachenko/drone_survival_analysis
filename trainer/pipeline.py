@@ -2,22 +2,36 @@
 
 ``train`` runs the same steps with the same parameters as the notebook and writes
 the same files (``artifacts/*.parquet``, ``artifacts/meta.json``,
-``models/best_{cox,aft}.json``), so ``dashboard.data.load`` and the existing
+``artifacts/model_card.json``, ``models/best_{cox,aft}.json``,
+``models/production_{cox,aft}.json``), so ``dashboard.data.load`` and the existing
 dashboards can read the result. The notebook stays the reference implementation.
+
+Two stages: the evaluation models are tuned on train, early-stopped on validation
+and reported on test; the production models are refitted on train + validation
+and must pass the release gate on test (``trainer.release``).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sksurv.nonparametric import kaplan_meier_estimator
 
+from trainer.artifacts import write_artifacts
+from trainer.release import (
+    MIN_FRAILTY_VARIANCE,
+    PRIORITY_HIGH,
+    PRIORITY_MEDIUM,
+    RUL_WINDOW,
+    GateConfig,
+    backtest_groups,
+    build_production,
+    model_card,
+)
 from utils import (
     SCALAR_METRICS,
     Model,
@@ -25,10 +39,22 @@ from utils import (
     calibration_curve,
     evaluate,
     evaluation_times,
-    fit_categories,
-    remaining_life,
     tune,
 )
+
+__all__ = [
+    "CAT_FEATURES",
+    "FEATURES",
+    "PRIORITY_HIGH",
+    "PRIORITY_MEDIUM",
+    "REQUIRED_COLUMNS",
+    "RUL_WINDOW",
+    "Cancelled",
+    "TrainConfig",
+    "prepare_frame",
+    "split_frame",
+    "train",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +81,6 @@ NUMERIC_FEATURES = [f for f in FEATURES if f not in CAT_FEATURES]
 REQUIRED_COLUMNS = ["drone_id", "commission_date", "duration_h", "event", *FEATURES]
 OPTIONAL_COLUMNS = ["failure_mode"]
 
-RUL_WINDOW = 100  # look-ahead window of the failure probability, flight hours
-PRIORITY_HIGH, PRIORITY_MEDIUM = 0.5, 0.2
 MIN_ROWS = 500
 MIN_EVENTS = {"train": 30, "val": 10, "test": 10}
 
@@ -83,6 +107,7 @@ class TrainConfig:
     n_trials: int = 60
     n_boot: int = 1000
     seed: int = 42
+    gate: GateConfig = field(default_factory=GateConfig)
 
 
 def prepare_frame(raw: pd.DataFrame) -> pd.DataFrame:
@@ -175,24 +200,20 @@ def split_frame(
     return train, val, test, t_val, t_test
 
 
-def _save_table(table: pd.DataFrame, directory: Path, name: str) -> None:
-    table.to_parquet(directory / f"{name}.parquet", index=False)
-
-
 def train(
     raw: pd.DataFrame,
     config: TrainConfig,
     out_dir: Path,
     progress: Progress | None = None,
 ) -> dict:
-    """Train Cox and AFT, evaluate them and write models and artifacts.
+    """Train Cox and AFT, evaluate them, build the production models and write everything.
 
     Parameters
     ----------
     raw : pd.DataFrame
         Training table (see ``prepare_frame``).
     config : TrainConfig
-        Number of Optuna trials and bootstrap replicates.
+        Number of Optuna trials and bootstrap replicates, release-gate thresholds.
     out_dir : Path
         Directory that receives ``models/`` and ``artifacts/``; created if missing.
     progress : callable, optional
@@ -207,7 +228,7 @@ def train(
     Raises
     ------
     ValueError
-        If the table fails validation.
+        If the table fails validation or leaves no remaining-life horizon.
     Cancelled
         If ``progress`` raised it.
     """
@@ -224,7 +245,6 @@ def train(
     step("Validating data", 0.0)
     df = prepare_frame(raw)
     train_df, val, test, t_val, t_test = split_frame(df)
-    cats = fit_categories(train_df, CAT_FEATURES)
 
     step("Tuning Cox", 0.02)
     best_cox = tune("cox", train_df, val, config.n_trials, FEATURES, CAT_FEATURES)
@@ -236,7 +256,7 @@ def train(
     for model in models.values():
         model.calibrate(train_df, val)
         # A variance of 0 means no heterogeneity was found: the model stays as trained
-        if model.calibration["frailty_variance"] < 1e-8:
+        if model.calibration["frailty_variance"] < MIN_FRAILTY_VARIANCE:
             model.calibration = None
 
     # Save and reload both models: checks the round trip, as the notebook does
@@ -265,32 +285,19 @@ def train(
         for h in horizons
     )
 
-    step("Bootstrap comparison", 0.68)
+    step("Bootstrap comparison", 0.66)
     boot_summary, boot_samples = bootstrap_compare(
         models, test, test, eval_times, n_boot=config.n_boot, seed=config.seed
     )
 
-    step("SHAP", 0.80)
+    step("SHAP", 0.78)
     shap_values = {name: model.explain(test) for name, model in models.items()}
-    shap_mean = pd.DataFrame(
-        {name: np.abs(e.values).mean(axis=0) for name, e in shap_values.items()},
-        index=FEATURES,
-    )
 
-    step("Remaining life and backtest", 0.88)
+    step("Backtest", 0.84)
     grid = np.linspace(1, np.quantile(train_df["duration_h"], 0.95), 200)
-    curves = {name: model.survival(test, grid) for name, model in models.items()}
-    km_test = kaplan_meier_estimator(
-        test["event"].astype(bool), test["duration_h"], conf_type="log-log"
-    )
-
-    landmark = np.quantile(test["duration_h"], 0.25)
-    at_risk = test[test["duration_h"] > landmark]
-    residual = at_risk["duration_h"] - landmark
-    at_risk_event = at_risk["event"].astype(bool)
-    at_risk_age = np.full(len(at_risk), landmark)
-    km_backtest = kaplan_meier_estimator(at_risk_event, residual, conf_type="log-log")
-    u = np.linspace(0, residual.quantile(0.9), 200)
+    landmark = float(np.quantile(test["duration_h"], 0.25))
+    residual = test.loc[test["duration_h"] > landmark, "duration_h"] - landmark
+    backtest_u = np.linspace(0, residual.quantile(0.9), 200)
 
     # "raw": the best model without the recalibration, to show what it changes
     backtest_models = dict(models)
@@ -298,215 +305,71 @@ def train(
         raw_model = Model.load(models_dir / f"best_{best_name}.json")
         raw_model.calibration = None
         backtest_models["raw"] = raw_model
-    group_rows = []
-    for name, model in backtest_models.items():
-        p_fail = (
-            1
-            - model.conditional_survival(at_risk, at_risk_age, np.array([RUL_WINDOW]))[
-                :, 0
-            ]
-        )
-        quintile = pd.qcut(p_fail, 5, labels=False)
-        for q in np.unique(quintile):
-            in_group = quintile == q
-            group_t, group_s, group_ci = kaplan_meier_estimator(
-                at_risk_event[in_group], residual[in_group], conf_type="log-log"
-            )
-            at_window = np.searchsorted(group_t, RUL_WINDOW, side="right") - 1
-            group_rows.append(
-                {
-                    "source": name,
-                    "quintile": q + 1,
-                    "n": int(in_group.sum()),
-                    "predicted": p_fail[in_group].mean(),
-                    "observed": 1 - group_s[at_window],
-                    "ci_low": 1 - group_ci[1][at_window],
-                    "ci_high": 1 - group_ci[0][at_window],
-                }
-            )
-    backtest_groups = pd.DataFrame(group_rows)
+    evaluation_backtest = pd.concat(
+        backtest_groups(model, test, landmark, RUL_WINDOW).assign(source=name)
+        for name, model in backtest_models.items()
+    )[["source", "quintile", "n", "predicted", "observed", "ci_low", "ci_high"]]
 
-    # Drones in service at the data cut-off; current age = duration_h. Keep age +
-    # horizon inside the Cox baseline support (flat after the last training event).
-    active = test[test["in_service"]]
-    last_train_event = train_df.loc[train_df["event"] == 1, "duration_h"].max()
-    horizon = (
-        float(np.floor(last_train_event - active["duration_h"].max()))
-        if len(active)
-        else 0.0
+    step("Production models (train + validation)", 0.88)
+    train_val = pd.concat([train_df, val])
+    production = build_production(
+        models,
+        best_name,
+        train_val,
+        test,
+        eval_times=eval_times,
+        horizons=horizons,
+        landmark=landmark,
+        evaluation_metrics=metrics,
+        evaluation_calibration=calibration,
+        models_dir=models_dir,
+        config=config.gate,
+        window=RUL_WINDOW,
     )
-    if len(active) and horizon <= 0:
-        raise ValueError(
-            "The oldest drone in service has flown longer than the last training "
-            "failure, so no remaining-life horizon exists"
-        )
-    rul = (
-        remaining_life(best_model, active, horizon=horizon, window=RUL_WINDOW)
-        if len(active)
-        else pd.DataFrame(
-            columns=["drone_id", "rul_q10", "rul_median", "rmrl", "p_fail_window"]
-        )
-    )
-
-    step("Writing artifacts", 0.95)
-    _save_table(metrics.reset_index(), artifacts_dir, "metrics")
-    _save_table(
-        pd.concat(
-            pd.DataFrame(
-                {
-                    "model": name,
-                    "t": eval_times,
-                    "brier": results[(name, "test")]["brier"],
-                    "auc": results[(name, "test")]["auc"],
-                }
-            )
-            for name in models
-        ),
-        artifacts_dir,
-        "brier_auc",
-    )
-    _save_table(calibration, artifacts_dir, "calibration")
-    _save_table(boot_summary, artifacts_dir, "bootstrap_summary")
-    _save_table(
-        pd.concat(
-            pd.DataFrame(
-                {
-                    "iteration": boot_samples.index,
-                    "model": model_name,
-                    "metric": metric,
-                    "value": boot_samples[(model_name, metric)].to_numpy(),
-                }
-            )
-            for model_name, metric in boot_samples.columns
-        ),
-        artifacts_dir,
-        "bootstrap_samples",
-    )
-
-    n_features = len(FEATURES)
-    _save_table(
-        pd.concat(
-            pd.DataFrame(
-                {
-                    "drone_id": np.repeat(test["drone_id"].to_numpy(), n_features),
-                    "model": name,
-                    "feature": np.tile(e.feature_names, len(test)),
-                    "shap": e.values.ravel(),
-                    "value": e.data.ravel(),
-                    "display": test[e.feature_names].astype(str).to_numpy().ravel(),
-                }
-            )
-            for name, e in shap_values.items()
-        ),
-        artifacts_dir,
-        "shap_values",
-    )
-    importance = shap_mean.reset_index(names="feature").melt(
-        id_vars="feature", var_name="model", value_name="mean_abs_shap"
-    )
-    importance["share"] = importance["mean_abs_shap"] / importance.groupby("model")[
-        "mean_abs_shap"
-    ].transform("sum")
-    _save_table(importance, artifacts_dir, "shap_importance")
-
-    # risk_group: terciles of the best model's risk over all test drones; priority:
-    # maintenance urgency of drones in service (failed or departed drones have none)
-    predictions = test.copy()
-    for name, model in models.items():
-        predictions[f"risk_{name}"] = model.risk(test)
-    predictions["risk_group"] = pd.qcut(
-        predictions[f"risk_{best_name}"], 3, labels=["Low", "Medium", "High"]
-    ).astype(str)
-    predictions = predictions.join(rul.drop(columns=["drone_id"]))
-    predictions["priority"] = np.select(
-        [
-            predictions["p_fail_window"] >= PRIORITY_HIGH,
-            predictions["p_fail_window"] >= PRIORITY_MEDIUM,
-            predictions["p_fail_window"].notna(),
-            predictions["event"] == 1,
-        ],
-        ["High", "Medium", "Low", "None (failed)"],
-        default="None (left the fleet)",
-    )
-    _save_table(predictions, artifacts_dir, "predictions")
-
-    _save_table(
-        pd.concat(
-            [
-                pd.DataFrame(
-                    {
-                        "source": "km",
-                        "t": km_test[0],
-                        "s": km_test[1],
-                        "ci_low": km_test[2][0],
-                        "ci_high": km_test[2][1],
-                    }
-                ),
-                *(
-                    pd.DataFrame({"source": name, "t": grid, "s": s.mean(axis=0)})
-                    for name, s in curves.items()
-                ),
-            ]
-        ),
-        artifacts_dir,
-        "survival_mean",
-    )
-    _save_table(
-        pd.concat(
-            [
-                pd.DataFrame(
-                    {
-                        "source": "km",
-                        "u": km_backtest[0],
-                        "s": km_backtest[1],
-                        "ci_low": km_backtest[2][0],
-                        "ci_high": km_backtest[2][1],
-                    }
-                ),
-                *(
-                    pd.DataFrame(
-                        {
-                            "source": name,
-                            "u": u,
-                            "s": model.conditional_survival(
-                                at_risk, at_risk_age, u
-                            ).mean(axis=0),
-                        }
-                    )
-                    for name, model in models.items()
-                ),
-            ]
-        ),
-        artifacts_dir,
-        "backtest",
-    )
-    _save_table(backtest_groups, artifacts_dir, "backtest_groups")
-
-    meta = {
-        "generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-        "best_name": best_name,
-        "models": {name: f"best_{name}.json" for name in models},
-        "features": FEATURES,
-        "cat_features": CAT_FEATURES,
-        "categories": cats,
-        "numeric_ranges": {
-            f: [float(train_df[f].min()), float(train_df[f].max())]
-            for f in NUMERIC_FEATURES
-            if f != "is_refurbished"
-        },
-        "split": {"t_val": str(t_val.date()), "t_test": str(t_test.date())},
-        "n_trials": config.n_trials,
-        "n_boot": len(boot_samples),
-        "eval_times": {name: eval_times.tolist() for name in splits},
-        "calibration_horizons": [float(h) for h in horizons],
-        "rul_horizon": horizon,
-        "rul_window": RUL_WINDOW,
-        "landmark": float(landmark),
-        "priority_thresholds": {"high": PRIORITY_HIGH, "medium": PRIORITY_MEDIUM},
-        "shap_base": {name: float(e.base_values[0]) for name, e in shap_values.items()},
+    split = {
+        "t_val": str(t_val.date()),
+        "t_test": str(t_test.date()),
+        "n_train": len(train_df),
+        "n_val": len(val),
+        "n_test": len(test),
     }
-    (artifacts_dir / "meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
+    card = model_card(
+        frame=df,
+        split=split,
+        models=models,
+        best_name=best_name,
+        evaluation_metrics=metrics,
+        production=production,
+        train_val=train_val,
+        settings={
+            "n_trials": config.n_trials,
+            "n_boot": config.n_boot,
+            "seed": config.seed,
+        },
+    )
+
+    step("Writing artifacts", 0.96)
+    meta = write_artifacts(
+        artifacts_dir,
+        test=test,
+        models=models,
+        best_name=best_name,
+        metrics=metrics,
+        results=results,
+        eval_times=eval_times,
+        horizons=horizons,
+        calibration=calibration,
+        boot_summary=boot_summary,
+        boot_samples=boot_samples,
+        shap_values=shap_values,
+        grid=grid,
+        landmark=landmark,
+        backtest_u=backtest_u,
+        backtest_groups=evaluation_backtest,
+        production=production,
+        card=card,
+        split=split,
+        n_trials=config.n_trials,
     )
     step("Done", 1.0)
     return meta

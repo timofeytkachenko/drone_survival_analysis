@@ -59,6 +59,9 @@ st.set_page_config(page_title="Drone failures", layout="wide")
 DATA, SETTINGS, HAZARD, DISAGREE = _load()
 PRED, TABLES, MODELS, META = DATA.predictions, DATA.tables, DATA.models, DATA.meta
 BEST = SETTINGS.best
+# Forecasts come from the production models (train + validation), see trainer.release
+FORECAST = SETTINGS.forecast
+FORECAST_MODELS = DATA.production
 
 
 def _fmt(text: str) -> str:
@@ -206,6 +209,10 @@ def quality_tab() -> None:
     st.subheader(tr(LANG, "ui.step_metrics"))
     _table(common.metrics_frame(metric_table, LANG))
     _explain("metrics", insights.metrics(metric_table, BEST, LANG))
+
+    st.subheader(tr(LANG, "ui.gate_title"))
+    _findings(common.gate_findings(DATA, LANG))
+    _table(common.gate_frame(DATA, LANG))
 
     st.subheader(tr(LANG, "ui.step_training"))
     _plot(figures.learning_curves(MODELS, LANG))
@@ -405,7 +412,7 @@ def fleet_tab() -> None:
     with right:
         _plot(
             figures.conditional_curves(
-                DATA.best_model,
+                DATA.forecast_model,
                 riskiest,
                 riskiest["duration_h"].to_numpy(),
                 SETTINGS.rul_grid,
@@ -537,13 +544,18 @@ def drone_tab() -> None:
     with right:
         _plot(
             figures.drone_survival(
-                MODELS, rows, SETTINGS.surv_grid, row["duration_h"], failed, LANG
+                FORECAST_MODELS,
+                rows,
+                SETTINGS.surv_grid,
+                row["duration_h"],
+                failed,
+                LANG,
             )
         )
         _explain("drone_survival")
         _plot(
             figures.drone_hazard(
-                MODELS,
+                FORECAST_MODELS,
                 rows,
                 common.drone_hazard_grid(SETTINGS, row["duration_h"]),
                 SETTINGS.hazard_bandwidth,
@@ -565,9 +577,12 @@ def drone_tab() -> None:
     )
     base_rows = common.whatif_base(PRED, drone_id)
     age = base_rows["duration_h"].to_numpy()
-    model = DATA.best_model
+    model = DATA.forecast_model
     title = tr(
-        LANG, "ui.remaining_life_title", age=age[0], model=labels["model_labels"][BEST]
+        LANG,
+        "ui.remaining_life_title",
+        age=age[0],
+        model=labels["model_labels"][FORECAST],
     )
     names = [tr(LANG, "ui.current_conditions"), tr(LANG, "ui.scenario")]
     left, right = st.columns(2)
@@ -575,8 +590,8 @@ def drone_tab() -> None:
         _plot(
             figures.shap_waterfall(
                 common.drone_contrib(DATA, drone_id),
-                META["shap_base"][BEST],
-                BEST,
+                META["shap_base_production"][FORECAST],
+                FORECAST,
                 lang=LANG,
             )
         )

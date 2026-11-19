@@ -442,9 +442,13 @@ LONG = {'model_labels': {'cox': 'Cox', 'aft': 'AFT'},
                    'the business needs *probabilities* (how many drones will fail, when to plan\n'
                    'maintenance), not just the order of drones.\n'
                    '\n'
-                   'The selected model is **{best}**. Its forecasts are used on "Fleet", "Drone '
-                   'card",\n'
-                   '"Score new drones" and in the risk groups.\n')],
+                   'The selected model is **{best}**. For forecasting, both models are refitted '
+                   'with the tuned settings on train + validation ({n_fit} drones; the number of '
+                   'trees is the one early stopping selected) and checked on the test set: see '
+                   '"Production model check" on "Model quality". Forecasts on "Fleet", "Drone '
+                   'card", "Score new drones" and in the risk groups come from the production '
+                   'model **{forecast}**: the selected model if it passed the check, otherwise '
+                   'the other one if that passed.\n')],
                   ['9. Statistical model comparison (bootstrap)',
                    ('\n'
                    'A metric difference on a single test set may be due to chance. So the test set '
@@ -903,8 +907,8 @@ LONG = {'model_labels': {'cox': 'Cox', 'aft': 'AFT'},
                                    'is the strength of the effect. The title shows the fleet '
                                    "average risk → this drone's risk. The 12 most influential "
                                    "features with the drone's values are shown.",
-                            'details': "SHAP decomposition of the best model's forecast: risk = "
-                                       'base + sum of contributions.'},
+                            'details': "SHAP decomposition of the production model's forecast: "
+                                       'risk = base + sum of contributions.'},
              'drone_whatif': {'what': 'Remaining-life forecast of the drone from its current '
                                       'flight hours: under current conditions (solid) and in the '
                                       'scenario (dashed, after "Recalculate").',
@@ -964,7 +968,7 @@ LONG = {'model_labels': {'cox': 'Cox', 'aft': 'AFT'},
                                  'age. A young drone high on the chart is risky for its age. An '
                                  'old drone low on the chart is not urgent just because it has '
                                  'flown a lot.',
-                          'details': "Risk groups are terciles of the selected model's risk score "
+                          'details': "Risk groups are terciles of the production model's risk score "
                                      'on the whole test fleet. The probability is the conditional '
                                      'chance of failing within {window:.0f} h given survival to '
                                      'the current age.'}}}

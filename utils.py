@@ -441,32 +441,56 @@ class Model:
         return dm
 
     def _margin(self, dm: xgb.DMatrix) -> np.ndarray:
-        """Raw margin using only the trees up to the early-stopping best iteration."""
+        """Raw margin using the trees up to ``best_iteration`` (see ``fit``)."""
         return self.booster.predict(
             dm,
             output_margin=True,
             iteration_range=(0, self.booster.best_iteration + 1),
         )
 
-    def fit(self, train: pd.DataFrame, valid: pd.DataFrame) -> "Model":
-        """Fit on ``train`` with early stopping on ``valid``.
+    def fit(
+        self,
+        train: pd.DataFrame,
+        valid: pd.DataFrame | None = None,
+        num_boost_round: int | None = None,
+    ) -> "Model":
+        """Fit on ``train``: early stopping on ``valid``, or a fixed number of rounds.
 
         Parameters
         ----------
         train : pd.DataFrame
             Training rows with ``duration_h`` and ``event``.
-        valid : pd.DataFrame
-            Validation rows used for early stopping.
+        valid : pd.DataFrame, optional
+            Validation rows used for early stopping. Without them the model is
+            trained for exactly ``num_boost_round`` rounds and all of them are
+            used for prediction.
+        num_boost_round : int, optional
+            Number of boosting rounds without ``valid``; the maximum number of
+            rounds with it (default ``NUM_BOOST_ROUND``).
 
         Returns
         -------
         Model
             The fitted model (``self``).
+
+        Raises
+        ------
+        ValueError
+            If neither ``valid`` nor ``num_boost_round`` is given, or
+            ``num_boost_round`` is not positive.
         """
+        if valid is None and num_boost_round is None:
+            raise ValueError("fit needs valid (early stopping) or num_boost_round")
+        if num_boost_round is not None and num_boost_round < 1:
+            raise ValueError("num_boost_round must be positive")
         self.calibration = None
+        self.history = {}
         self.categories = fit_categories(train, self.cat_features)
         dtrain = self._dmatrix(train)
-        dvalid = self._dmatrix(valid)
+        evals = [(dtrain, "train")]
+        if valid is not None:
+            # Early stopping monitors the last entry, so "valid" must stay last.
+            evals.append((self._dmatrix(valid), "valid"))
 
         if self.kind == "cox":
             objective, metric = "survival:cox", "cox-nloglik"
@@ -478,13 +502,18 @@ class Model:
         self.booster = xgb.train(
             params,
             dtrain,
-            num_boost_round=self.NUM_BOOST_ROUND,
-            # Early stopping monitors the last entry, so "valid" must stay last.
-            evals=[(dtrain, "train"), (dvalid, "valid")],
+            num_boost_round=num_boost_round or self.NUM_BOOST_ROUND,
+            evals=evals,
             evals_result=self.history,
-            early_stopping_rounds=self.EARLY_STOPPING_ROUNDS,
+            early_stopping_rounds=(
+                None if valid is None else self.EARLY_STOPPING_ROUNDS
+            ),
             verbose_eval=False,
         )
+        if valid is None:
+            # XGBoost defines best_iteration only under early stopping; every
+            # prediction path reads it, so point it at the last trained round.
+            self.booster.best_iteration = num_boost_round - 1
 
         if self.kind == "cox":
             risk = np.exp(self._margin(dtrain))
@@ -495,10 +524,38 @@ class Model:
             )
         return self
 
+    def refit(self, data: pd.DataFrame) -> "Model":
+        """New model with the same parameters, fitted on ``data`` without validation.
+
+        The number of boosting rounds is the one early stopping selected for this
+        model (``best_iteration + 1``). Used to retrain on training plus
+        validation rows once tuning and model choice are done.
+
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Rows with ``duration_h`` and ``event``.
+
+        Returns
+        -------
+        Model
+            A new fitted model; ``self`` is unchanged. It is not recalibrated.
+
+        Raises
+        ------
+        RuntimeError
+            If this model has not been fitted.
+        """
+        if self.booster is None:
+            raise RuntimeError("Model.fit must be called before refit")
+        return Model(self.kind, self.params, self.features, self.cat_features).fit(
+            data, num_boost_round=self.booster.best_iteration + 1
+        )
+
     def calibrate(
         self,
         train: pd.DataFrame,
-        valid: pd.DataFrame,
+        valid: pd.DataFrame | None = None,
         n_folds: int = 5,
         seed: int = 0,
     ) -> "Model":
@@ -522,8 +579,10 @@ class Model:
         ----------
         train : pd.DataFrame
             Training rows with ``duration_h`` and ``event``.
-        valid : pd.DataFrame
-            Validation rows, used for early stopping of the fold fits.
+        valid : pd.DataFrame, optional
+            Validation rows, used for early stopping of the fold fits. Without
+            them every fold fit uses this model's number of rounds
+            (``best_iteration + 1``).
         n_folds : int, default 5
             Number of cross-fitting folds.
         seed : int, default 0
@@ -545,6 +604,7 @@ class Model:
             raise RuntimeError("Model.fit must be called before calibrate")
         if n_folds < 2:
             raise ValueError("n_folds must be at least 2")
+        rounds = None if valid is not None else self.booster.best_iteration + 1
         fold = np.random.default_rng(seed).permutation(len(train)) % n_folds
         cum_hazard = np.empty(len(train))
         for k in range(n_folds):
@@ -552,7 +612,7 @@ class Model:
             rows = train[held_out]
             fold_model = Model(
                 self.kind, self.params, self.features, self.cat_features
-            ).fit(train[~held_out], valid)
+            ).fit(train[~held_out], valid, num_boost_round=rounds)
             cum_hazard[held_out] = fold_model._cum_hazard_at(
                 fold_model._predict_margin(rows),
                 rows["duration_h"].to_numpy()[:, None],

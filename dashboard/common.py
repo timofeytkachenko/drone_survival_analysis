@@ -48,6 +48,7 @@ class Settings:
     """Run settings derived from ``meta.json`` and the test predictions."""
 
     best: str
+    forecast: str
     features: list[str]
     cat_features: list[str]
     horizon: float
@@ -67,6 +68,7 @@ class Settings:
         bandwidth = hazard_bandwidth(pred["duration_h"], pred["event"])
         return cls(
             best=data.best_name,
+            forecast=data.forecast_name,
             features=meta["features"],
             cat_features=meta["cat_features"],
             horizon=meta["rul_horizon"],
@@ -109,6 +111,8 @@ def text_context(data: DashboardData, settings: Settings, lang: str = "en") -> d
             labels["feature_labels"][f].lower() for f in settings.cat_features
         ),
         "best": labels["model_labels"][settings.best],
+        "forecast": labels["model_labels"][settings.forecast],
+        "n_fit": data.card["data"]["n_fit"],
         "generated_at": meta["generated_at"].replace("T", " "),
     }
 
@@ -449,6 +453,68 @@ def bootstrap_frame(summary: pd.DataFrame, lang: str = "en") -> pd.DataFrame:
     return frame.round(4)
 
 
+def gate_frame(data: DashboardData, lang: str = "en") -> pd.DataFrame:
+    """Release-gate checks of every production model, one row per model and check."""
+    labels = bundle(lang)
+    names = labels["gate_checks"]
+    rows = []
+    for kind, result in data.gate["kinds"].items():
+        for check in result["checks"]:
+            reference = check["reference"]
+            rows.append(
+                {
+                    tr(lang, "ui.model"): labels["model_labels"][kind],
+                    tr(lang, "ui.gate_check"): names[check["name"]],
+                    tr(lang, "ui.gate_value"): f"{check['value']:.4g}",
+                    tr(lang, "ui.gate_reference"): (
+                        "—" if reference is None else f"{reference:.4g}"
+                    ),
+                    tr(lang, "ui.gate_threshold"): f"{check['threshold']:.4g}",
+                    tr(lang, "ui.gate_result"): tr(
+                        lang, "ui.gate_pass" if check["passed"] else "ui.gate_fail"
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def gate_findings(data: DashboardData, lang: str = "en") -> list[str]:
+    """What the release gate decided and which model makes the forecasts."""
+    labels, gate = bundle(lang), data.gate
+    names = labels["model_labels"]
+    forecast, best = data.forecast_name, data.best_name
+    out = [
+        tr(
+            lang,
+            "phrases.gate_scheme",
+            n_fit=data.card["data"]["n_fit"],
+            n_test=len(data.predictions),
+        )
+    ]
+    failed = [
+        labels["gate_checks"][check["name"]]
+        for check in gate["kinds"][best]["checks"]
+        if not check["passed"]
+    ]
+    if gate["release_kind"] is None:
+        out.append(
+            tr(lang, "phrases.gate_none", name=names[forecast], checks=", ".join(failed))
+        )
+    elif forecast != best:
+        out.append(
+            tr(
+                lang,
+                "phrases.gate_switched",
+                best=names[best],
+                checks=", ".join(failed),
+                name=names[forecast],
+            )
+        )
+    else:
+        out.append(tr(lang, "phrases.gate_passed", name=names[forecast]))
+    return out
+
+
 # --- Risk factors -------------------------------------------------------------------
 
 
@@ -504,9 +570,9 @@ def fleet_tooltips(settings: Settings, lang: str = "en") -> dict[str, str]:
 
 
 def main_factor_labels(data: DashboardData, lang: str = "en") -> pd.Series:
-    """drone_id -> feature that raises the selected model's risk the most."""
-    shap = data.tables["shap_values"]
-    part = shap[(shap["model"] == data.best_name) & (shap["shap"] > 0)]
+    """drone_id -> feature that raises the forecasting model's risk the most."""
+    shap = data.tables["shap_production"]
+    part = shap[(shap["model"] == data.forecast_name) & (shap["shap"] > 0)]
     if part.empty:
         return pd.Series(dtype=str)
     top = part.loc[part.groupby("drone_id")["shap"].idxmax()]
@@ -618,10 +684,11 @@ def drone_features(row: pd.Series, features: list[str], lang: str = "en") -> pd.
 
 
 def drone_contrib(data: DashboardData, drone_id: str) -> pd.DataFrame:
-    """SHAP contributions of the best model for one drone."""
-    shap_values = data.tables["shap_values"]
+    """SHAP contributions of the forecasting (production) model for one drone."""
+    shap_values = data.tables["shap_production"]
     return shap_values[
-        (shap_values["drone_id"] == drone_id) & (shap_values["model"] == data.best_name)
+        (shap_values["drone_id"] == drone_id)
+        & (shap_values["model"] == data.forecast_name)
     ]
 
 
@@ -640,14 +707,14 @@ def drone_findings(
 ) -> list[str]:
     """Narrative explanation of one drone."""
     rows = drone_rows(data.predictions, drone_id)
-    curve = data.best_model.survival(rows, settings.surv_grid)[0]
+    curve = data.forecast_model.survival(rows, settings.surv_grid)[0]
     below = curve <= 0.5
     predicted_median = settings.surv_grid[below.argmax()] if below.any() else np.inf
     findings = insights.drone(
         rows.iloc[0],
         drone_contrib(data, drone_id),
         data.predictions,
-        settings.best,
+        settings.forecast,
         settings.window,
         predicted_median,
         lang,
@@ -656,12 +723,14 @@ def drone_findings(
     age = float(row["duration_h"])
     if row["in_service"] and settings.hazard_grid[0] <= age <= settings.hazard_grid[-1]:
         at_age = np.array([age])
-        rate = data.best_model.hazard(rows, at_age, settings.hazard_bandwidth)[0, 0]
+        rate = data.forecast_model.hazard(rows, at_age, settings.hazard_bandwidth)[0, 0]
         pred = data.predictions
         fleet_rate = observed_hazard(
             pred["duration_h"], pred["event"], at_age, settings.hazard_bandwidth
         )[0][0]
-        findings.append(insights.drone_hazard(age, rate, fleet_rate, settings.best, lang))
+        findings.append(
+            insights.drone_hazard(age, rate, fleet_rate, settings.forecast, lang)
+        )
     return findings
 
 
@@ -806,7 +875,7 @@ def _risk_group(risk: np.ndarray, reference: pd.Series) -> np.ndarray:
 def score_upload(
     raw: pd.DataFrame, data: DashboardData, settings: Settings, lang: str = "en"
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Validate an uploaded table of drones and forecast them with the best model.
+    """Validate an uploaded table of drones and forecast them with the production model.
 
     Parameters
     ----------
@@ -916,12 +985,12 @@ def score_upload(
             tr(lang, "phrases.too_old", n=int(too_old.sum()), column=AGE_COLUMN, max_age=max_age)
         )
 
-    model = data.best_model
+    model = data.forecast_model
     rows = frame.assign(duration_h=frame[AGE_COLUMN])
     life = remaining_life(model, rows, settings.horizon, settings.window)
     scored = frame.assign(
         risk_group=_risk_group(
-            model.risk(rows), data.predictions[f"risk_{settings.best}"]
+            model.risk(rows), data.predictions[f"forecast_risk_{settings.forecast}"]
         ),
         p_fail_window=life["p_fail_window"],
         rul_q10=life["rul_q10"],

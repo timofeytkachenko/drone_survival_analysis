@@ -658,7 +658,9 @@ def drone(
 ) -> list[str]:
     """Narrative explanation of one drone's prediction."""
     out = []
-    top = (pred[f"risk_{best}"] >= row[f"risk_{best}"]).mean()
+    # ``best`` is the forecasting kind: the position uses the production model's risk
+    risk = f"forecast_risk_{best}"
+    top = (pred[risk] >= row[risk]).mean()
     if row["event"] == 1:
         timing = (
             (tr(lang, "phrases.before") if row["duration_h"] < predicted_median else tr(lang, "phrases.after"))
@@ -692,7 +694,7 @@ def drone(
                 priority=_lab(lang, "priority_labels", row["priority"]),
             )
         )
-    bottom = (pred[f"risk_{best}"] <= row[f"risk_{best}"]).mean()
+    bottom = (pred[risk] <= row[risk]).mean()
     position = tr(
         lang,
         "phrases.riskiest_share" if top <= 0.5 else "phrases.least_share",

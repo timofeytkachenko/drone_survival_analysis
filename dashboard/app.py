@@ -29,6 +29,9 @@ PRED = DATA.predictions
 TABLES = DATA.tables
 MODELS = DATA.models
 BEST = SETTINGS.best
+# Forecasts come from the production models (train + validation), see trainer.release
+FORECAST = SETTINGS.forecast
+FORECAST_MODELS = DATA.production
 FEATURES = SETTINGS.features
 CAT_FEATURES = SETTINGS.cat_features
 WINDOW = SETTINGS.window
@@ -317,6 +320,9 @@ def quality_tab(lang: str) -> dbc.Container:
                 _explain("metrics", lang, insights.metrics(metric_table, BEST, lang)),
                 className="mt-2",
             ),
+            html.H5(tr(lang, "ui.gate_title")),
+            _findings(common.gate_findings(DATA, lang), lang),
+            _datatable(common.gate_frame(DATA, lang), "gate-table"),
             html.H5(tr(lang, "ui.step_training")),
             _graph(figures.learning_curves(MODELS, lang)),
             _explain("learning_curves", lang, insights.learning(MODELS, lang)),
@@ -600,7 +606,7 @@ def fleet_tab(lang: str) -> dbc.Container:
                         [
                             _graph(
                                 figures.conditional_curves(
-                                    DATA.best_model,
+                                    DATA.forecast_model,
                                     riskiest,
                                     riskiest["duration_h"].to_numpy(),
                                     SETTINGS.rul_grid,
@@ -1044,10 +1050,10 @@ def update_drone(drone_id: str, lang: str):
     return (
         info,
         figures.drone_survival(
-            MODELS, rows, SETTINGS.surv_grid, row["duration_h"], failed, lang
+            FORECAST_MODELS, rows, SETTINGS.surv_grid, row["duration_h"], failed, lang
         ),
         figures.drone_hazard(
-            MODELS,
+            FORECAST_MODELS,
             rows,
             common.drone_hazard_grid(SETTINGS, row["duration_h"]),
             SETTINGS.hazard_bandwidth,
@@ -1057,8 +1063,8 @@ def update_drone(drone_id: str, lang: str):
         ),
         figures.shap_waterfall(
             common.drone_contrib(DATA, drone_id),
-            META["shap_base"][BEST],
-            BEST,
+            META["shap_base_production"][FORECAST],
+            FORECAST,
             lang=lang,
         ),
         _findings(common.drone_findings(DATA, SETTINGS, drone_id, lang), lang),
@@ -1078,9 +1084,9 @@ def update_whatif(drone_id: str, _clicks: int | None, values: list, lang: str):
     order = common.whatif_order(FEATURES)
     rows = common.whatif_base(PRED, drone_id)
     age = rows["duration_h"].to_numpy()
-    model = DATA.best_model
+    model = DATA.forecast_model
     labels = bundle(lang)["model_labels"]
-    title = tr(lang, "ui.remaining_life_title", age=age[0], model=labels[BEST])
+    title = tr(lang, "ui.remaining_life_title", age=age[0], model=labels[FORECAST])
     current = tr(lang, "ui.current_conditions")
     baseline = figures.conditional_curves(
         model, rows, age, SETTINGS.rul_grid, [current], title, lang=lang

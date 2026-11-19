@@ -1,9 +1,11 @@
-"""Run registry and background training job.
+"""Training runs: one directory per run and the job that fills it.
 
 A run is a directory ``RUNS_DIR/<run_id>/`` with ``status.json`` and, once training
 succeeded, ``artifacts/`` and ``models/`` in the layout ``dashboard.data.load`` reads.
-Only one training job runs at a time, in a thread of the app process; the state
-lives in ``status.json`` so a page reload or a restart does not lose it.
+A finished run with a model card is a candidate version (see ``trainer.registry``).
+Only one training job runs at a time across the studio and the CLI (a file lock in
+``RUNS_DIR``); the state lives in ``status.json`` so a page reload or a restart
+does not lose it.
 """
 
 from __future__ import annotations
@@ -16,19 +18,23 @@ import re
 import secrets
 import shutil
 import threading
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
-from trainer.pipeline import Cancelled, TrainConfig, train
+from trainer.fslock import LockBusyError, locked
+from trainer.pipeline import Cancelled, Progress, TrainConfig, train
+from trainer.release import FORMAT_VERSION
 
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))
 _RUN_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+_TRAIN_LOCK = ".train.lock"
 _LOCK = threading.Lock()
 _JOB: dict[str, object] = {"thread": None, "cancel": None, "run_id": None}
 
@@ -92,25 +98,55 @@ def list_runs() -> list[dict]:
     return runs
 
 
+def read_card(run_id: str) -> dict | None:
+    """Model card of a run; ``None`` if it is missing, unreadable or of an old format."""
+    try:
+        card = json.loads(
+            (run_path(run_id) / "artifacts" / "model_card.json").read_text()
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return card if card.get("format") == FORMAT_VERSION else None
+
+
 def usable(status: dict) -> bool:
-    """True if the run finished and its files are in place."""
+    """True if the run finished and has production models (a candidate version)."""
+    return status.get("state") == "done" and read_card(status["id"]) is not None
+
+
+def legacy(status: dict) -> bool:
+    """True for a finished run of an older version: evaluation models only.
+
+    Such a run has no production models or model card, so it can be neither
+    opened nor promoted; it is listed until deleted.
+    """
     base = run_path(status["id"])
-    return status.get("state") == "done" and (base / "artifacts" / "meta.json").exists()
+    return (
+        status.get("state") == "done"
+        and (base / "artifacts" / "meta.json").exists()
+        and read_card(status["id"]) is None
+    )
 
 
 def mark_stale_running() -> int:
-    """Mark runs left ``running`` by a killed process as failed; return their count."""
+    """Mark runs left ``running`` by a killed process as failed; return their count.
+
+    Does nothing while any process holds the training lock: a run that is
+    ``running`` then may be alive in the CLI or another container.
+    """
     count = 0
-    with _LOCK:
-        live = _JOB["run_id"] if _is_alive() else None
-        for status in list_runs():
-            if status.get("state") == "running" and status["id"] != live:
-                _update(
-                    status["id"],
-                    state="failed",
-                    error="Interrupted: the container stopped during training",
-                )
-                count += 1
+    try:
+        with _LOCK, locked(RUNS_DIR / _TRAIN_LOCK, blocking=False):
+            for status in list_runs():
+                if status.get("state") == "running":
+                    _update(
+                        status["id"],
+                        state="failed",
+                        error="Interrupted: the process stopped during training",
+                    )
+                    count += 1
+    except LockBusyError:
+        return 0
     return count
 
 
@@ -164,6 +200,34 @@ def job_running() -> bool:
     return _is_alive()
 
 
+def _create_run(raw: pd.DataFrame, config: TrainConfig, source_name: str) -> str:
+    """Create the run directory with its initial ``status.json``."""
+    run_id = new_run_id()
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    run_path(run_id).mkdir()
+    digest = hashlib.sha256(
+        pd.util.hash_pandas_object(raw, index=False).to_numpy().tobytes()
+    ).hexdigest()[:12]
+    _write_status(
+        run_id,
+        {
+            "id": run_id,
+            "state": "running",
+            "stage": "Queued",
+            "fraction": 0.0,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "finished": None,
+            "source": os.path.basename(source_name),
+            "data_hash": digest,
+            "n_rows": len(raw),
+            "config": asdict(config),
+            "log": [],
+            "error": None,
+        },
+    )
+    return run_id
+
+
 def start_training(raw: pd.DataFrame, config: TrainConfig, source_name: str) -> str:
     """Start a background training run.
 
@@ -184,41 +248,71 @@ def start_training(raw: pd.DataFrame, config: TrainConfig, source_name: str) -> 
     Raises
     ------
     JobBusyError
-        If another job is running.
+        If another job is running in this or another process.
     """
     with _LOCK:
         if _is_alive():
             raise JobBusyError("A training job is already running")
-        run_id = new_run_id()
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        run_path(run_id).mkdir()
-        digest = hashlib.sha256(
-            pd.util.hash_pandas_object(raw, index=False).to_numpy().tobytes()
-        ).hexdigest()[:12]
-        _write_status(
-            run_id,
-            {
-                "id": run_id,
-                "state": "running",
-                "stage": "Queued",
-                "fraction": 0.0,
-                "created": datetime.now().isoformat(timespec="seconds"),
-                "finished": None,
-                "source": os.path.basename(source_name),
-                "data_hash": digest,
-                "n_rows": len(raw),
-                "config": asdict(config),
-                "log": [],
-                "error": None,
-            },
-        )
-        cancel = threading.Event()
-        thread = threading.Thread(
-            target=_run_job, args=(run_id, raw.copy(), config, cancel), daemon=True
-        )
-        _JOB.update(thread=thread, cancel=cancel, run_id=run_id)
-        thread.start()
+        # The thread takes over the lock and releases it when the job ends
+        held = ExitStack()
+        try:
+            held.enter_context(locked(RUNS_DIR / _TRAIN_LOCK, blocking=False))
+        except LockBusyError as exc:
+            raise JobBusyError("A training job is running in another process") from exc
+        try:
+            run_id = _create_run(raw, config, source_name)
+            cancel = threading.Event()
+            thread = threading.Thread(
+                target=_run_job,
+                args=(run_id, raw.copy(), config, cancel, held),
+                daemon=True,
+            )
+            _JOB.update(thread=thread, cancel=cancel, run_id=run_id)
+            thread.start()
+        except BaseException:
+            held.close()
+            raise
     return run_id
+
+
+def run_training(
+    raw: pd.DataFrame,
+    config: TrainConfig,
+    source_name: str,
+    progress: Progress | None = None,
+) -> dict:
+    """Train in the calling thread and return the final status of the run.
+
+    Parameters
+    ----------
+    raw : pd.DataFrame
+        Training table.
+    config : TrainConfig
+        Training settings.
+    source_name : str
+        File name, kept for display only.
+    progress : callable, optional
+        ``progress(stage, fraction)`` called between stages.
+
+    Returns
+    -------
+    dict
+        ``status.json`` of the run; ``state`` is ``done`` or ``failed``.
+
+    Raises
+    ------
+    JobBusyError
+        If another job is running in this or another process.
+    """
+    held = ExitStack()
+    try:
+        held.enter_context(locked(RUNS_DIR / _TRAIN_LOCK, blocking=False))
+    except LockBusyError as exc:
+        raise JobBusyError("A training job is running in another process") from exc
+    with held:
+        run_id = _create_run(raw, config, source_name)
+        _run_job(run_id, raw, config, threading.Event(), ExitStack(), progress)
+    return read_status(run_id)
 
 
 def cancel_training() -> None:
@@ -229,8 +323,14 @@ def cancel_training() -> None:
 
 
 def _run_job(
-    run_id: str, raw: pd.DataFrame, config: TrainConfig, cancel: threading.Event
+    run_id: str,
+    raw: pd.DataFrame,
+    config: TrainConfig,
+    cancel: threading.Event,
+    held: ExitStack,
+    echo: Progress | None = None,
 ) -> None:
+    """Train into the run directory; ``held`` (the training lock) is released at the end."""
     base = run_path(run_id)
     work = base / "work"
 
@@ -240,30 +340,50 @@ def _run_job(
         status = read_status(run_id)
         status["log"].append(f"{datetime.now():%H:%M:%S} {stage}")
         _update(run_id, stage=stage, fraction=fraction, log=status["log"])
+        if echo is not None:
+            echo(stage, fraction)
 
-    try:
-        meta = train(raw, config, work, progress)
-        (work / "artifacts").replace(base / "artifacts")
-        (work / "models").replace(base / "models")
-        work.rmdir()
-        metrics = pd.read_parquet(base / "artifacts" / "metrics.parquet")
-        test = metrics[metrics["split"] == "test"].set_index("model")
-        _update(
-            run_id,
-            state="done",
-            stage="Done",
-            fraction=1.0,
-            finished=datetime.now().isoformat(timespec="seconds"),
-            best_name=meta["best_name"],
-            test_metrics=test[["c_index_ipcw", "ibs"]].round(4).to_dict(orient="index"),
-        )
-    except Cancelled:
-        _fail(run_id, work, "cancelled", "Cancelled by the user")
-    except ValueError as exc:
-        _fail(run_id, work, "failed", str(exc))
-    except Exception as exc:
-        logger.exception("Training run %s failed", run_id)
-        _fail(run_id, work, "failed", f"{type(exc).__name__}: {exc}")
+    with held:
+        try:
+            meta = train(raw, config, work, progress)
+            (work / "artifacts").replace(base / "artifacts")
+            (work / "models").replace(base / "models")
+            work.rmdir()
+            metrics = pd.read_parquet(base / "artifacts" / "metrics.parquet")
+            test = metrics[metrics["split"] == "test"].set_index("model")
+            gate = json.loads((base / "artifacts" / "model_card.json").read_text())[
+                "gate"
+            ]
+            _update(
+                run_id,
+                state="done",
+                stage="Done",
+                fraction=1.0,
+                finished=datetime.now().isoformat(timespec="seconds"),
+                best_name=meta["best_name"],
+                forecast_name=meta["forecast_name"],
+                gate={
+                    "passed": gate["passed"],
+                    "release_kind": gate["release_kind"],
+                    "kinds": {k: v["passed"] for k, v in gate["kinds"].items()},
+                },
+                test_metrics=test[["c_index_ipcw", "ibs"]]
+                .round(4)
+                .to_dict(orient="index"),
+            )
+            logger.info(
+                "Run %s finished: gate %s, release kind %s",
+                run_id,
+                "passed" if gate["passed"] else "failed",
+                gate["release_kind"],
+            )
+        except Cancelled:
+            _fail(run_id, work, "cancelled", "Cancelled by the user")
+        except ValueError as exc:
+            _fail(run_id, work, "failed", str(exc))
+        except Exception as exc:
+            logger.exception("Training run %s failed", run_id)
+            _fail(run_id, work, "failed", f"{type(exc).__name__}: {exc}")
 
 
 def _fail(run_id: str, work: Path, state: str, message: str) -> None:

@@ -19,13 +19,15 @@ To do this it uses **survival analysis**: a family of statistical methods for "t
 - [Data](#data)
 - [How the pipeline works](#how-the-pipeline-works)
 - [Models: Cox and AFT](#models-cox-and-aft)
+- [From evaluation to production](#from-evaluation-to-production)
 - [How we check quality](#how-we-check-quality)
 - [Remaining life and maintenance priority](#remaining-life-and-maintenance-priority)
 - [Explaining forecasts (SHAP) and "what if" scenarios](#explaining-forecasts-shap-and-what-if-scenarios)
 - [Scoring new drones](#scoring-new-drones)
 - [Limitations and assumptions](#limitations-and-assumptions)
 - [FAQ](#faq)
-- [Running the project](#running-the-project) (including the [Docker studio](#training-and-scoring-studio-docker))
+- [Running the project](#running-the-project)
+- [Production use: studio, CLI and API](#production-use-studio-cli-and-api)
 - [Project structure](#project-structure)
 - [Glossary](#glossary)
 
@@ -40,15 +42,17 @@ These are the results of the current run (`artifacts/meta.json`). After re-runni
 | Drones in the data | 5000; 61% failed during the observation period, 39% are censored |
 | Test set | 1001 drones commissioned from 2025-04-10 onwards |
 | Best model (selected on validation) | AFT (log-logistic). Cox is within 0.0005 IBS on validation, so the choice is close to a tie |
-| C-index (Uno) on test | 0.658: in 66% of comparable pairs the model correctly identifies which drone fails first (Cox: 0.665) |
-| Integrated Brier score on test | 0.175 versus 0.25 for a 50/50 forecast (Cox: 0.171) |
-| Drones in service in the test set | 500: 2 high, 92 medium and 406 low maintenance priority |
+| C-index (Uno) on test, evaluation models | AFT 0.658, Cox 0.665: in 66% of comparable pairs the model correctly identifies which drone fails first |
+| Integrated Brier score on test, evaluation models | AFT 0.175, Cox 0.171, versus 0.25 for a 50/50 forecast |
+| Production model (makes every forecast) | **Cox**, refitted on train + validation (3999 drones): C-index (Uno) 0.666 and IBS 0.169 on test. AFT failed the release check on calibration (5.6 pp against a limit of 5.0), so it is not released; see [From evaluation to production](#from-evaluation-to-production) |
+| Drones in service in the test set | 500: 4 high, 101 medium and 395 low maintenance priority |
 
 **What this means for the business.**
 
+- Quality is measured on models that never saw validation or test labels (the *evaluation* models). Forecasts for drones come from the *production* model: the same settings refitted on all data except the test set, and released only after a check on the test set.
 - The model ranks drones by risk with confidence. The "who to maintain first" list is clearly better than random.
 - Failure probabilities are calibrated at fleet level, more closely by Cox than by AFT. Cox's mean predicted survival curve stays inside the 95% confidence interval of the observed curve over the whole informative range (21-385 h); AFT's does on 88% of it (it is 3.5 pp too pessimistic at 256 h). Aggregate forecasts can be used to plan spare parts and the maintenance budget, with Cox as the cross-check. A correction for hidden differences between drones removes most of the overstated risk of the riskiest drones in Cox (see [Models](#models-cox-and-aft)); AFT does not need it.
-- Cox and AFT rank drones equally well (p from 0.08 to 0.27). Cox is slightly more accurate in probabilities (IBS 0.171 against 0.175, p = 0.018), which does not pass the strict threshold for four metrics. The model was chosen on validation, where the two differ by 0.0004 IBS, so treat the choice as a tie and look at both.
+- Cox and AFT rank drones equally well (p from 0.08 to 0.27). Cox is slightly more accurate in probabilities (IBS 0.171 against 0.175, p = 0.018), which does not pass the strict threshold for four metrics. On validation the two differ by 0.0004 IBS, so the selection is a tie; the release check then decides which one may make forecasts, and in this run that is Cox.
 - The fleet failure rate (hazard) is roughly flat at about 0.18 failures per 100 flight hours: roughly 16% of the drones still flying fail within each next 100 h, whatever their age. The likely reason is that wear-out of motors and batteries and early electronics failures offset each other at fleet level. So replacing drones just because they are old buys little; maintenance should be targeted by each drone's risk factors. Cox follows this rate (inside its uncertainty band on 98% of the range, on average 9% lower); AFT's log-logistic shape lets the hazard fall with age: it stays inside the band on 72% of the range and predicts 13.0% failures in the next 100 h for drones that survived 348 h against an observed 17.1%.
 - The strongest risk factors differ between the models. In Cox they are temperature, humidity, battery wear at commissioning, firmware version and operating environment. In AFT, hard landings carry 57% of the total influence, followed by temperature, humidity and firmware. These are **associations** learned by the model, not proven causes (see [Limitations](#limitations-and-assumptions)); where the models disagree, do not act on a single factor ranking.
 
@@ -129,11 +133,17 @@ drone_survival.ipynb:  split by commissioning date → hyper-parameter tuning (O
                        → train Cox and AFT (XGBoost) → recalibration
                        → survival curves and hazard
                        → metrics, calibration, bootstrap → SHAP
-                       → conditional survival → backtest → remaining life → artifacts
+                       → conditional survival → backtest
+                       → production models (refit on train + validation) → release check
+                       → remaining life of drones in service → artifacts
            ↓
-models/*.json, artifacts/*.parquet, artifacts/meta.json
+models/best_*.json (evaluation), models/production_*.json, artifacts/*.parquet,
+artifacts/meta.json, artifacts/model_card.json
            ↓
 dashboard: Dash (dashboard/app.py) or Streamlit (dashboard/streamlit_app.py)
+
+The same steps as a service (trainer/): studio or CLI trains a run → release check
+→ promote to production → studio, CLI and API score new drones → scoring log and drift
 ```
 
 **Split by time, not at random.** Drones are sorted by commissioning date:
@@ -144,12 +154,14 @@ dashboard: Dash (dashboard/app.py) or Streamlit (dashboard/streamlit_app.py)
 
 This mimics real use: a model trained on the older fleet forecasts new drones. Test drones have fewer flight hours and more censoring: the failure share is 66% in training, 55% in validation and 45% in test.
 
-**Leakage protection:**
+**Leakage protection** (evaluation models, the ones the quality figures describe):
 
 - the category vocabulary, feature ranges and the Cox baseline hazard are computed on training data only;
 - hyper-parameters and the best model are chosen on validation only;
 - the recalibration is fitted on training drones, each predicted by a fit that did not see it;
 - the test set is used only for the final evaluation.
+
+The production models are fitted on training + validation and never on the test set. The test set is then used a second time, for the release check, so that check is slightly optimistic (see [Limitations](#limitations-and-assumptions)).
 
 ---
 
@@ -173,10 +185,38 @@ Both models are XGBoost gradient boosting with loss functions designed for censo
 **Recalibration for hidden differences between drones.** Drones with the same features still differ in durability. The weaker ones fail first, so the survivors of a high-risk group are sturdier than their features suggest. Cox assumes a constant risk ratio between drones and therefore overstates the risk of risky drones that have already flown a long time. `Model.calibrate` corrects the cumulative hazard $H$ to $\log(1 + v \cdot k \cdot H) / v$, where $v$ is the variance of the hidden durability (gamma frailty). It changes the probabilities and the remaining life, not the order of drones.
 
 - The two parameters are fitted on the training set by five-fold cross-fitting: each drone is predicted by a model that did not see it.
-- A model keeps the correction only if $v > 0$. In the current run $v = 0.29$ for Cox. For AFT $v = 0$: its log-logistic hazard already falls with age, so AFT is used as trained.
-- Effect on Cox for the 500 drones in service, checked against the generator's true probabilities: the error (RMSE) of P(failure in 100 h) falls from 7.6 to 5.3 pp, and the expected remaining life goes from 494 to 557 h against a true 536 h (the correction slightly overshoots here).
+- A model keeps the correction only if $v > 0$. In the current run $v = 0.29$ for the evaluation Cox model and $v = 0.27$ for the production one. For AFT $v = 0$: its log-logistic hazard already falls with age, so AFT is used as trained.
+- Effect on the production Cox model for the 500 drones in service, checked against the generator's true probabilities: the error (RMSE) of P(failure in 100 h) falls from 7.3 to 5.3 pp, and the expected remaining life goes from 494 to 553 h against a true 536 h (the correction slightly overshoots here).
 
 **Choosing the best model:** by validation IBS (AFT 0.1519, Cox 0.1524). The test set plays no part in the choice, and on test Cox is slightly ahead, which is why the difference should not be over-read.
+
+---
+
+## From evaluation to production
+
+The models above are the **evaluation** models. They exist to measure quality honestly, so they are trained on the oldest 70% of drones only. Using them to score new drones would waste the newest 10% (validation), the cohort closest to the drones being scored.
+
+**Production models.** For each of Cox and AFT the notebook (section 8) and the studio fit a second model:
+
+- same tuned hyper-parameters, and the number of trees that early stopping selected (not rescaled for the larger sample);
+- fitted on training + validation (3999 drones), the test set untouched;
+- category vocabulary, Cox baseline hazard, recalibration (again on drones the fit did not see) and feature ranges recomputed on the same 3999 drones.
+
+**Release check.** A production model cannot be validated on data it was trained on, so it is compared on the test set with its own evaluation model. It is released only if every check passes:
+
+| Check | Rule | Default limit | Cox | AFT |
+|---|---|---|---|---|
+| C-index (Uno) | not below the evaluation model by more than the tolerance | 0.01 | 0.666 vs 0.665, pass | 0.657 vs 0.658, pass |
+| Integrated Brier score | not above the evaluation model by more than the tolerance | 0.005 | 0.169 vs 0.171, pass | 0.175 vs 0.175, pass |
+| Mean calibration error over deciles and three horizons | not above the limit | 5.0 pp | 4.1 pp, pass | **5.6 pp, fail** |
+| Landmark backtest: fifths with the forecast inside the 95% interval | at least | 4 of 5 | 5, pass | 5, pass |
+| Save and load, finite values, recalibration converged | technical | | pass | pass |
+
+**Which model makes the forecasts.** The model selected on validation, if its production model passed; otherwise the next one that passed. In this run AFT was selected on validation by a margin of 0.0004 IBS and failed the calibration check (its evaluation model is also above the limit, at 5.3 pp), so the fleet forecast, the priorities, the risk groups and the scoring of new drones use the **production Cox** model. If no model passes, nothing can be promoted to production.
+
+The limits are defaults of `GateConfig` in `trainer/release.py` and can be set through `GATE_*` environment variables. They were fixed before this run and were not adjusted to its result. Decide them in advance: a limit moved after seeing which model fails is no longer a check. With about 100 drones per decile the calibration limit of 5 pp is close to the sampling noise of the estimate, so a model near the limit may pass or fail on a re-run with other data.
+
+**What changed for the maintenance queue.** Compared with the previous version of this project, where the evaluation AFT model made the forecasts: priorities go from 2 / 92 / 406 (high / medium / low) to 4 / 101 / 395, 55 of the 500 drones change priority, the two forecasts correlate at 0.90 (Spearman), and expected failures in the next 100 h go from 70 to 74 against 74 by the generator's truth. Most of the difference comes from the change of model, not from the extra 500 training drones: the production AFT model gives 2 / 88 / 410.
 
 ---
 
@@ -210,13 +250,15 @@ Current result: the ranking metrics do not differ (p from 0.08 to 0.27). Cox has
 
 Take the test drones that survived to 119 h (the landmark). For them, compare the conditional survival predicted by the model with the observed KM curve of remaining life. This directly checks what maintenance relies on: the forecast of "how much longer will a drone that has already flown $a$ hours keep flying".
 
-The check is repeated inside each fifth of the predicted P(failure in 100 h), the quantity behind the maintenance priority (notebook and the "Fleet" tab). In the current run Cox's forecast lies inside the 95% interval of the observed share in all five fifths: in the riskiest it predicts 31% against an observed 28% (35% before the recalibration). AFT, the selected model, lies inside in four fifths; in the riskiest it predicts 35% against an observed 25% (95% interval 18-33%), i.e. it overstates the risk of the riskiest drones in this backtest.
+The check is repeated inside each fifth of the predicted P(failure in 100 h), the quantity behind the maintenance priority (notebook and the "Fleet" tab). In the current run Cox's forecast lies inside the 95% interval of the observed share in all five fifths: in the riskiest it predicts 31% against an observed 28% (35% before the recalibration). AFT, the model selected on validation, lies inside in four fifths; in the riskiest it predicts 35% against an observed 25% (95% interval 18-33%), i.e. it overstates the risk of the riskiest drones in this backtest.
+
+The same backtest is part of the release check of the production models. The production Cox model lies inside the interval in all five fifths (riskiest: 31% predicted against 29% observed, interval 22-38%).
 
 ---
 
 ## Remaining life and maintenance priority
 
-For each drone **in service** (a test drone still flying at the data cut-off) with current flight hours $a$, the conditional survival $S(a+u)/S(a)$ gives:
+For each drone **in service** (a test drone still flying at the data cut-off) with current flight hours $a$, the conditional survival $S(a+u)/S(a)$ of the production model gives:
 
 | Measure | Meaning | How to use it |
 |---|---|---|
@@ -225,7 +267,7 @@ For each drone **in service** (a test drone still flying at the data cut-off) wi
 | **Median remaining life** | The drone works longer than this with 50% probability | Typical expected life |
 | **Expected remaining life** | Mean remaining life within the horizon (1111 h) | Fleet capacity planning |
 
-**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\thinspace dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; Cox predicts 17.3%, 14.4%, 15.9% and 15.5%, AFT 18.3%, 16.8%, 14.9% and 13.0% (it falls with age, which the data do not show). So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
+**How age changes the outlook.** Conditional survival and hazard are linked: $S(a+u)/S(a) = \exp(-\int_a^{a+u} h(t)\thinspace dt)$. With a flat hazard the outlook barely depends on how long a drone has already flown. The notebook checks this at fleet level for drones that survived 0, 119, 219 and 348 h. The observed probability of failing within the next 100 h is 17.5%, 15.2%, 17.5% and 17.1%; the evaluation models predict 17.3%, 14.4%, 15.9% and 15.5% (Cox) and 18.3%, 16.8%, 14.9% and 13.0% (AFT: it falls with age, which the data do not show). So age alone says little about the next 100 h; the differences between drones come mostly from their characteristics. This holds at fleet level: an individual drone's hazard can still rise (see its card in the dashboard).
 
 **Maintenance priority:**
 
@@ -233,11 +275,11 @@ For each drone **in service** (a test drone still flying at the data cut-off) wi
 - **Medium**: from 20% to 50%;
 - **Low**: below 20%.
 
-The thresholds are set in the notebook (`PRIORITY_HIGH`, `PRIORITY_MEDIUM`) and should be agreed with the business: the cost of downtime, of maintenance and of an in-flight failure.
+The thresholds are set in `trainer/release.py` (`PRIORITY_HIGH`, `PRIORITY_MEDIUM`) and should be agreed with the business: the cost of downtime, of maintenance and of an in-flight failure. With the current forecasts, a high-priority threshold of 40% gives 9 drones and 30% gives 32.
 
-The **risk group** (Low / Medium / High) is the tercile of the risk score across all test drones, including failed ones. It shows the drone's relative risk from its characteristics, regardless of flight hours. The **maintenance priority** takes current flight hours into account, so only drones in service have one.
+The **risk group** (Low / Medium / High) is the tercile of the production model's risk score across all test drones, including failed ones. It shows the drone's relative risk from its characteristics, regardless of flight hours. The **maintenance priority** takes current flight hours into account, so only drones in service have one.
 
-**Forecast horizon.** Remaining life is not computed beyond 1111 h. Beyond the last failure in the training data, Cox has no information about the hazard. An "infinite" remaining life means the 50% (or 10%) risk level is not reached within the horizon.
+**Forecast horizon.** Remaining life is not computed beyond 1111 h. Beyond the last failure in the data the production model was fitted on, Cox has no information about the hazard. An "infinite" remaining life means the 50% (or 10%) risk level is not reached within the horizon.
 
 ---
 
@@ -251,7 +293,9 @@ The **risk group** (Low / Medium / High) is the tercile of the risk score across
 
 Cox and AFT importances are compared as **shares**, not absolute values: Cox contributions are on the log hazard ratio scale, AFT contributions on the log time scale.
 
-**"What if" scenario** (the "Drone card" tab): change a drone's features (lower the payload, update the firmware, change the environment) and see how the failure probability and remaining life change. Example on the current artifacts: for DR-002709, lowering average humidity from 86% to 50% changes P(failure in 100 h) from 26.8% to 26.4% in AFT (the selected model) but from 45.8% to 37.2% in Cox, with the median remaining life going from 113 to 154 h. The models disagree both on the level and on how much humidity matters, which is the reason to read what-if results from both before acting.
+The fleet-wide SHAP charts describe the evaluation models. The breakdown on the drone card explains the forecast shown there, so it uses the production model.
+
+**"What if" scenario** (the "Drone card" tab): change a drone's features (lower the payload, update the firmware, change the environment) and see how the failure probability and remaining life change. Example on the current artifacts: for DR-002709, lowering average humidity from 86% to 50% changes P(failure in 100 h) from 51.8% to 39.6% in the production Cox model (the one the dashboard uses), with the median remaining life going from 96 to 137 h, but only from 27.3% to 25.1% in the production AFT model. The models disagree both on the level and on how much humidity matters, so treat a what-if result as one model's answer, not as a measured effect.
 
 > SHAP and "what if" explain the **model**, not the physics of failure. If a factor only correlates with the real cause, the model attributes the effect to it. Before management decisions ("let's move the whole fleet to firmware 5"), check the conclusions with engineers or a pilot experiment.
 
@@ -259,7 +303,7 @@ Cox and AFT importances are compared as **shares**, not absolute values: Cox con
 
 ## Scoring new drones
 
-The "Score new drones" tab in both dashboards forecasts drones from your own CSV file: a batch you plan to buy, or an export of your current fleet. The best model scores each row exactly like the drones on the "Fleet" tab.
+The "Score new drones" tab in both dashboards forecasts drones from your own CSV file: a batch you plan to buy, or an export of your current fleet. The production model scores each row exactly like the drones on the "Fleet" tab. For regular use, score through the studio, the command line or the API (see [Production use](#production-use-studio-cli-and-api)): they use the version promoted to production, log every batch and report input drift. The file format and the validation below are the same everywhere.
 
 **File format** (one row per drone):
 
@@ -290,10 +334,12 @@ The "Score new drones" tab in both dashboards forecasts drones from your own CSV
 4. **Independent censoring.** The IPCW-corrected metrics and the method itself assume that leaving the observation (sale, retirement) is unrelated to failure risk. If drones are more often sold just before failing, the estimates will be optimistic. Censoring also depends on one feature: a drone that flies more hours per day reaches the data cut-off with more flight hours. On these data this shifts the test IBS by about 1% (checked against the generator's true failure times).
 5. **All failure types are combined.** The model forecasts "the first critical failure of any type". Planning spare parts by type (batteries separately from motors) needs a competing-risks analysis.
 6. **Drones in service** are the censored test drones whose flight log reaches the data cut-off: commissioning date plus flight hours divided by daily utilisation. Censored drones last seen earlier (53 of 553 in the current run) are treated as having left the fleet and get no forecast. This relies on `daily_utilization_h` being the average over the whole service period; on a real fleet use the operator's status field instead.
-7. **The remaining-life horizon** is limited by the last failure in training (1111 h). Beyond it Cox cannot estimate how the hazard grows. The far end of the Cox baseline rests on few training drones (20 still flying at 1761 h, 4 at 2348 h), so long-horizon figures for the oldest drones are noisy.
-8. **The near-term risk of the riskiest drones is somewhat overstated.** Against the generator's true probabilities, the two high-priority drones are forecast at 61% against a true 53% (AFT, the selected model), and the riskiest fifth of drones in service at 26.9% against a true 26.5%. Cox without the recalibration forecasts the riskiest fifth at 37.5% against 28.2%; with it, 29.7%. In the landmark [backtest](#4-remaining-life-backtest) the selected AFT overstates its riskiest fifth (35% against an observed 25%). Treat the high-priority list as a ranking of who to inspect first and its probabilities as an upper estimate. On a real fleet only the backtest is available, and its intervals are wide.
+7. **The remaining-life horizon** is limited by the last failure in the data the production model was fitted on (1111 h). Beyond it Cox cannot estimate how the hazard grows. The far end of the Cox baseline rests on few drones (20 still flying at 1761 h, 4 at 2348 h), so long-horizon figures for the oldest drones are noisy.
+8. **The near-term risk of the riskiest drones is somewhat overstated.** Against the generator's true probabilities, the four high-priority drones are forecast at 58% against a true 44% (production Cox), and the riskiest fifth of drones in service at 28.8% against a true 28.2%. Without the recalibration the riskiest fifth would be forecast at 35.9% against 28.4%. Treat the high-priority list as a ranking of who to inspect first and its probabilities as an upper estimate. On a real fleet only the [backtest](#4-remaining-life-backtest) is available, and its intervals are wide.
 9. **The split is by cohort, not by calendar time.** Training drones are followed up to the data cut-off, i.e. after the test drones were commissioned. Nothing in these data depends on calendar time, so it does no harm here; with seasonal or fleet-wide effects it would leak the future into training.
 10. **Correlation, not causation.** See the SHAP section.
+11. **The production model has no untouched test set of its own.** It is checked on the same test set that the quality figures use, so the release check is slightly optimistic, and its quality after release can only be confirmed by monitoring: input drift on every scored batch (available) and a backtest once outcomes of the scored drones are known (a retraining run does this on the new data).
+12. **Drift monitoring covers inputs, not outcomes.** The population stability index says that scored drones differ from the training drones in some feature. It does not say the forecasts are wrong, and it cannot see a change in how features relate to failures.
 
 ---
 
@@ -309,19 +355,28 @@ The risk group is how risky the drone's characteristics are relative to the othe
 Both sets are scored on the same time points, so the gap is real: C-index (Uno) goes from 0.719 to 0.658 and IBS from 0.152 to 0.175 for AFT (Cox: 0.718 to 0.665 and 0.152 to 0.171). Validation is optimistic because the hyper-parameters, early stopping and the choice of model all used it, and with 500 drones its estimates are also noisier. Quote the test figures.
 
 **Why was AFT chosen if Cox is better on test?**
-The model is chosen by probability accuracy (IBS) on validation, in advance and without looking at the test set. There AFT leads by 0.0004, well inside the noise. On test Cox is ahead on IBS (0.171 against 0.175, p = 0.018, not significant after the correction for four metrics) and its fleet-level calibration and hazard fit are better, while the ranking is equal. Selecting by test would leak the test set, so the rule stays; read the Cox column as a cross-check. If you prefer Cox as the primary model, set `best_name = "cox"` in the notebook and re-run the cells after it.
+The model is chosen by probability accuracy (IBS) on validation, in advance and without looking at the test set. There AFT leads by 0.0004, well inside the noise. On test Cox is ahead on IBS (0.171 against 0.175, p = 0.018, not significant after the correction for four metrics) and its fleet-level calibration and hazard fit are better, while the ranking is equal. Selecting by test would leak the test set, so the rule stays. AFT is still the "best model" in the quality tables, but it does not make the forecasts: its production model failed the release check on calibration, so the production Cox model is used (see [From evaluation to production](#from-evaluation-to-production)).
+
+**Why train a second, production model instead of using the evaluated one?**
+The evaluated models did not see the newest 10% of drones (validation), which are the closest in time to the drones being scored. The production model uses them. Its quality cannot be measured on the data it was trained on, which is why the evaluation models are kept for the report and the production model is only checked against them on the test set.
+
+**Why not train the production model on the test set too?**
+Then nothing would be left to check it on: a model fitted on all drones can only be trusted by analogy with the evaluated one. The test set is the only guard between a bad refit and the maintenance queue.
+
+**The release check failed for every model. What now?**
+Nothing is promoted and the previous production version keeps scoring. Look at which check failed in the studio ("Release" tab) or in `model_card.json`. A failed C-index or IBS check means the refit is worse than the evaluated model, which points at the data (a changed validation cohort). A failed calibration or backtest check means the probabilities are off. Do not raise a limit to let the model through.
 
 **Can I trust an "expected remaining life" of 900+ h?**
 With caution. The further the horizon, the less data supports it. For planning, "life until 10% risk" and P(failure in 100 h) are more reliable.
 
 **How often should the model be retrained?**
-When new failures accumulate, especially at high flight hours: they extend the forecast horizon. Also after fleet changes (new drone models, firmware, regions). A sign of ageing is worsening calibration in a backtest on fresh data.
+When new failures accumulate, especially at high flight hours: they extend the forecast horizon. Also after fleet changes (new drone models, firmware, regions), and when the drift report shows a significant shift in the scored drones (PSI above 0.25) or unknown categories. A sign of ageing is worsening calibration in a backtest on fresh data. The procedure is in [Operating procedure](#operating-procedure).
 
 **Is a C-index of 0.66 good?**
 For two randomly chosen drones, one of which failed earlier, the model points to it correctly in 66% of cases (random guessing gives 50%). For equipment failures with a lot of individual randomness this is a working level. Perfection is unattainable here, because part of the variation is not explained by any feature.
 
 **Can I score drones that are not in the data?**
-Yes: use the "Score new drones" tab (see [Scoring new drones](#scoring-new-drones)). Keep feature values within the training ranges for reliable forecasts.
+Yes: use the studio, the command line or the API (see [Production use](#production-use-studio-cli-and-api)), or the "Score new drones" tab of the dashboards. Keep feature values within the training ranges for reliable forecasts.
 
 ---
 
@@ -338,7 +393,8 @@ uv run python generate_drone_survival.py
 
 # 3. Training, evaluation and artifacts: run all notebook cells
 uv run jupyter lab drone_survival.ipynb
-#    output: models/best_{cox,aft}.json, artifacts/*.parquet, artifacts/meta.json
+#    output: models/best_{cox,aft}.json (evaluation), models/production_{cox,aft}.json,
+#            artifacts/*.parquet, artifacts/meta.json, artifacts/model_card.json
 
 # 4a. Dash dashboard → http://127.0.0.1:8050
 uv run python -m dashboard.app
@@ -347,34 +403,11 @@ uv run python -m dashboard.app
 uv run streamlit run dashboard/streamlit_app.py
 ```
 
-The `data/`, `models/` and `artifacts/` directories are not stored in git and are created by steps 2–3. A full notebook run overwrites the models and artifacts. The dashboards refuse to start on artifacts from an older notebook version (a missing table, no `in_service` column or different priority labels) and ask you to re-run the notebook.
+The `data/`, `models/` and `artifacts/` directories are not stored in git and are created by steps 2–3. A full notebook run overwrites the models and artifacts. The dashboards refuse to start on artifacts from an older notebook version (no production models or model card, a missing table, no `in_service` column or different priority labels) and ask you to re-run the notebook.
 
 Generator parameters (number of drones, effect strength, hidden frailty, etc.) are listed by `uv run python generate_drone_survival.py --help`.
 
-### Training and scoring studio (Docker)
-
-A separate Streamlit app, `trainer/app.py`, trains the models on **your own CSV** and scores other files with them. It runs the same steps with the same defaults as `drone_survival.ipynb` (time split, Optuna tuning with 60 trials per model, frailty recalibration, bootstrap, SHAP, remaining life), and writes the same files, so a finished run can be read by the dashboards above.
-
-```bash
-docker compose build
-docker compose up        # http://localhost:8501
-```
-
-| Tab | What it does |
-|---|---|
-| Data | Upload the training CSV; the schema is checked (see below) and a summary and split sizes are shown |
-| Train | Choose Optuna trials and bootstrap replicates, start training; it runs in the background with a progress log and can be cancelled between stages |
-| Runs | All runs with state, best model and test metrics; select the active run or delete one |
-| Results | Metrics, calibration, bootstrap, SHAP importance and the fleet queue of the active run |
-| Score | Upload any CSV in the "Scoring new drones" format and score it with Cox or AFT of the active run (default: the run's best); download the result |
-
-**Training CSV.** One row per drone with `drone_id` (unique), `commission_date`, `duration_h` (> 0), `event` (0 or 1), the 16 features from [Data](#data) (`daily_utilization_h` must be positive and non-empty), and optionally `failure_mode`. At least 500 drones are required, with enough failures in each split. A bad file is rejected with the reason; the "Download an empty template" button gives the header.
-
-**Storage.** Each run lives in the volume `studio_runs` mounted at `/app/runs` (`<run_id>/status.json`, `artifacts/`, `models/`), so runs survive container restarts and are not stored in git. A run left "running" by a stopped container is marked failed on the next start. The training CSV itself is not kept, only its row count and a short hash. One training job runs at a time.
-
-**Equivalence with the notebook.** On `data/drone_survival.csv` with the default settings the studio gives metrics identical to `artifacts/metrics.parquet` and the same priority counts. The notebook remains the reference; the studio is a second implementation of the same steps in `trainer/pipeline.py`.
-
-**Limits.** The input schema is fixed to the 16 drone features. Models are trained in the app process on CPU; a full run on 5000 drones takes about a minute on a laptop. The image is built in two stages from `python:3.13-slim` (the builder has a compiler for `ecos` and `scikit-survival`, which have no wheels on Linux aarch64; the final image has none) and installs the dependencies from `uv.lock`; the container runs as an unprivileged user. Do not expose the port to untrusted users: the app has no authentication.
+To train on your own data and score new drones regularly, use the studio, the command line or the API: see [Production use](#production-use-studio-cli-and-api).
 
 ### Dashboard
 
@@ -385,11 +418,149 @@ Both dashboards show the same content and have an English/Russian language switc
 | Overview | Key numbers, queue size at alternative high-priority thresholds (30/40/50%), main findings, fleet survival curve, failure cause structure and timing, observed failure rate (hazard) by flight hours |
 | Methodology | Analysis steps, tuned hyper-parameters, feature dictionary with ranges, glossary |
 | Failure segments | Kaplan-Meier curves and log-rank test by drone model, environment, firmware, refurbished drones, risk group and maintenance priority; failure structure and statistics by segment |
-| Model quality | Metrics, learning curves, predicted vs observed survival and failure rate (plus the five drones on which Cox and AFT disagree most), Brier and AUC over time, calibration, bootstrap |
+| Model quality | Metrics of the evaluation models, the production model check (every release check for Cox and AFT), learning curves, predicted vs observed survival and failure rate (plus the five drones on which Cox and AFT disagree most), Brier and AUC over time, calibration, bootstrap |
 | Risk factors | Feature importance, SHAP point cloud, dependence plots |
 | Fleet | Table of drones in service with maintenance priority, filters, CSV download and link to the drone card; hours flown against failure probability; remaining-life histogram and curves of the riskiest drones; backtest of the forecast, overall and by risk group |
 | Drone card | Remaining-life forecast, the drone's failure rate by flight hours, SHAP breakdown of the risk, "what if" scenario |
 | Score new drones | CSV template, upload, validation, forecasts for each drone and CSV download |
+
+Quality charts and tables describe the evaluation models. Everything that is a forecast for a drone (the fleet table, the drone card with its SHAP breakdown and "what if", the scoring tab) comes from the production model.
+
+---
+
+## Production use: studio, CLI and API
+
+The `trainer/` package runs the notebook's steps as a service: train a version on **your own CSV**, check it, promote it to production, and score new drones with it. Three entry points share one volume with the runs, so they always use the same production model and give the same forecasts:
+
+| Entry point | For | How |
+|---|---|---|
+| Studio (Streamlit) | people: train, review, promote, roll back, score a file, look at drift | `docker compose up`, http://127.0.0.1:8501 |
+| Command line | scheduled jobs and scripts: the same operations in batch | `python -m trainer.cli …` |
+| REST API | other systems: score drones on request | `docker compose up`, http://127.0.0.1:8000 |
+
+### Start
+
+```bash
+cp .env.example .env     # then set STUDIO_PASSWORD (≥ 12 characters) and API_KEY (≥ 32)
+docker compose up --build
+```
+
+`docker compose` refuses to start while either secret is empty. A value can be generated with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. `.env` is ignored by git and is not sent to the Docker build.
+
+Without Docker (from the project root; the runs go to `./runs` unless `RUNS_DIR` is set):
+
+```bash
+STUDIO_PASSWORD=… uv run streamlit run trainer/app.py
+API_KEY=… uv run python -m trainer.api
+```
+
+Both refuse to work without their secret. `REQUIRE_AUTH=false` switches the check off and is meant for local development only.
+
+### Studio
+
+| Tab | What it does |
+|---|---|
+| Data | Upload the training CSV; the schema is checked (see below) and a summary and split sizes are shown |
+| Train | Choose Optuna trials and bootstrap replicates, start training; it runs in the background with a progress log and can be cancelled between stages |
+| Runs | All runs with state, best model, release-check result and test metrics; select the active run or delete one (the production version cannot be deleted; a deleted earlier version is skipped by rollback) |
+| Results | Metrics, production model check, calibration, bootstrap, SHAP importance and the fleet queue of the active run |
+| Release | The production version, promotion of a run that passed the release check, rollback to the previous version, history of promotions |
+| Score | Upload any CSV in the ["Scoring new drones"](#scoring-new-drones) format; scored with the production model by default (or with the active run, to compare before promoting); shows the drift of the batch; download the result |
+| Monitoring | The scoring log: batches, priorities, mean risk, share of out-of-range rows, maximum PSI and its feature |
+
+**Training CSV.** One row per drone with `drone_id` (unique), `commission_date`, `duration_h` (> 0), `event` (0 or 1), the 16 features from [Data](#data) (`daily_utilization_h` must be positive and non-empty), and optionally `failure_mode`. At least 500 drones are required, with enough failures in each split. A bad file is rejected with the reason; the "Download an empty template" button gives the header.
+
+A run trained before production models existed is listed as "evaluation only": it cannot be opened, scored with or promoted. Retrain on the same file.
+
+### Versions: promote and roll back
+
+Every finished run is a candidate version. Scoring uses the version that was **promoted to production**, not the newest run, so training never changes forecasts by itself.
+
+- A run can be promoted only with a model that passed the [release check](#from-evaluation-to-production); by default the one the check selected. There is no override: to release a model that failed, change the limits in `.env` and retrain, so the decision is recorded in the run.
+- Rollback returns to the version that was in production before. Promotions and rollbacks are kept in the history with time and note.
+- The pointer is the file `production.json` in the volume. It is replaced atomically under a file lock, and the API reads it on every request, so a promotion or rollback takes effect in all three entry points without a restart.
+
+### Command line
+
+```bash
+# in the container                                     # or locally
+docker compose exec studio /app/.venv/bin/python -m trainer.cli status
+uv run python -m trainer.cli train data/drone_survival.csv [--trials 60] [--boot 1000] [--promote]
+uv run python -m trainer.cli status [--history]        # production version and all runs
+uv run python -m trainer.cli promote <run_id> [--kind cox|aft] [--note "…"]
+uv run python -m trainer.cli rollback
+uv run python -m trainer.cli score new_drones.csv forecasts.csv [--run <run_id>] [--lang en|ru]
+uv run python -m trainer.cli drift new_drones.csv      # drift of a file, nothing is logged
+uv run python -m trainer.cli drift                     # the last logged batches
+```
+
+Exit codes, for schedulers: 0 success; 1 bad input (file, data, arguments); 2 the release check failed or the version cannot be promoted or rolled back; 3 no production model; 4 another training job is running. `train` exits with 2 when no model passed the check; with `--promote` it promotes the selected model when one did. In either case a failed check leaves the previous production version in place.
+
+### REST API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | Liveness, no key. Reports whether a production model is set |
+| `GET /v1/model` | The production version: run, model, training data hash, release check, test metrics, feature list |
+| `POST /v1/score` | Forecast a batch. Body: `text/csv` (the same file the studio accepts) or `application/json` (`{"drones": [{…}, …]}` or a list of rows). `?lang=ru` for Russian warnings |
+
+Every `/v1` request needs the header `X-API-Key`. Errors: 401 wrong or missing key, 413 body or batch too large, 415 unsupported content type, 422 the batch failed validation (the reason is in `detail`), 503 no production model.
+
+```bash
+curl -s -H "X-API-Key: $API_KEY" -H "Content-Type: text/csv" \
+     --data-binary @new_drones.csv http://127.0.0.1:8000/v1/score
+```
+
+The response has `model` (run, kind, training data hash), `n`, `warnings`, `drift` and `results`: one object per drone with the same columns as the studio's CSV. The interactive documentation (`/docs`) is off unless `API_DOCS=true`.
+
+### Monitoring
+
+Every batch scored through the studio, the CLI or the API is compared with the drones the production model was trained on, and one line is appended to `scoring_log.jsonl` in the volume: time, source, version, number of drones, priority counts, mean risk, share of out-of-range rows, unknown categories, and the population stability index (PSI) per feature. The log holds aggregates and a short hash of the batch (to recognise a repeated file): no drone rows and no identifiers.
+
+**How to read PSI.** It measures how far the distribution of a feature in the batch is from training: below 0.1 stable, 0.1-0.25 a moderate shift, above 0.25 a significant shift (these are the conventional thresholds, not tuned to this fleet). With fewer than 100 drones in the batch the index is too noisy and no level is reported. A significant shift means the model is being asked about drones unlike those it learned from: check the forecasts of that batch and plan a retraining. PSI watches inputs only; it cannot tell that the forecasts became wrong (see [Limitations](#limitations-and-assumptions), item 12).
+
+### Operating procedure
+
+1. **Retrain** on a fresh export (studio "Train" tab or `trainer.cli train`). Production is not affected.
+2. **Review** the run: the release check, test metrics against the current production version, the fleet queue. Score a known batch with the candidate ("Score" tab → active run, or `score --run`) and compare with production.
+3. **Promote** it with a note saying why. From this moment every entry point scores with the new version.
+4. **Watch** the monitoring tab or `trainer.cli drift`. If the forecasts look wrong, **roll back**: one click or one command, no restart.
+
+### Configuration
+
+All settings are environment variables (`.env` for Docker). A bad value stops the service with a message naming the variable.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STUDIO_PASSWORD` | required | Password of the studio sign-in form, at least 12 characters |
+| `API_KEY` | required | Key expected in `X-API-Key`, at least 32 characters |
+| `REQUIRE_AUTH` | `true` | `false` lets a service start without its secret; local development only |
+| `MAX_UPLOAD_MB` | 20 | Largest uploaded file or API request body |
+| `MAX_TRAIN_ROWS` | 200000 | Largest training table |
+| `MAX_SCORE_ROWS` | 10000 | Largest scoring batch (cannot be raised above 10000) |
+| `GATE_C_INDEX_TOLERANCE`, `GATE_IBS_TOLERANCE`, `GATE_MAX_CALIBRATION_ERROR`, `GATE_MIN_BACKTEST_GROUPS` | 0.01, 0.005, 0.05, 4 | Release-check limits; stored with every run |
+| `LOG_LEVEL`, `LOG_FORMAT` | `INFO`, `json` | One JSON object per line on stderr; `LOG_FORMAT=text` for a terminal |
+| `API_DOCS` | `false` | Expose `/docs` and `/openapi.json` |
+| `RUNS_DIR` | `./runs` (`/app/runs` in Docker) | Runs, production pointer and scoring log |
+
+### Storage and containers
+
+- **Volume.** `studio_runs`, mounted at `/app/runs` in both services: `<run_id>/` (`status.json`, `artifacts/`, `models/`), `production.json`, `scoring_log.jsonl`. It is the only state: back it up, and both containers can be recreated freely. The training CSV itself is not kept, only its row count and hash.
+- **One training job at a time**, across the studio and the CLI in any container (a file lock in the volume). A run left "running" by a stopped container is marked failed on the next start.
+- **Image.** Built in two stages from `python:3.13-slim`; the builder has a compiler for `ecos` and `scikit-survival` (no wheels on Linux aarch64), the final image has none. Dependencies come from `uv.lock`.
+- **Container hardening** (`docker-compose.yml`): unprivileged user, read-only root file system with a `tmpfs` at `/tmp`, all capabilities dropped, `no-new-privileges`, limits on CPU, memory and processes, health checks, log rotation. Ports are published on `127.0.0.1` only.
+
+### Security notes
+
+- The studio password is **one shared secret**, not user accounts: there is no audit of who promoted a version beyond the note. For named users put the studio behind your identity provider (Streamlit supports OIDC sign-in via `st.login`) or an authenticating reverse proxy.
+- Neither service terminates TLS. Before opening the ports beyond the host, put a TLS reverse proxy in front; the password and the API key otherwise travel in clear text.
+- Secrets come from the environment only and are never logged; the API access log records the path and status, not the key or the body.
+- Uploaded files are untrusted input: the size limit applies before parsing, the row limit and the schema check before training or scoring.
+- The file locks rely on POSIX `flock`: the services run on Linux and macOS, not on Windows without WSL, and the volume must be a local file system.
+
+### Equivalence with the notebook
+
+The studio and the CLI run `trainer/pipeline.py`, which calls the same functions as the notebook (`utils.py`, `trainer/release.py`, `trainer/artifacts.py`). On `data/drone_survival.csv` with the default settings a CLI run gives every artifact table identical to the notebook's (maximum difference 0) and the same release-check result. A full run on 5000 drones takes about a minute on a laptop CPU. The input schema is fixed to the 16 drone features.
 
 ---
 
@@ -397,17 +568,28 @@ Both dashboards show the same content and have an English/Russian language switc
 
 ```
 generate_drone_survival.py   synthetic data generator
-drone_survival.ipynb         training, evaluation, explanation, remaining life, artifacts
-predict_drone.ipynb          scoring one drone with the saved model
+drone_survival.ipynb         training, evaluation, explanation, production models and release check,
+                             remaining life, artifacts
+predict_drone.ipynb          scoring one drone with the saved production model
 debug_predictions.ipynb      hand-made recomputation of one drone's forecast, step by step,
                              checked against the library (debug_predictions_RU.ipynb: Russian)
 utils.py                     Model (Cox/AFT on XGBoost, recalibration), tune, evaluation_times, evaluate,
                              calibration_curve, bootstrap_compare, remaining_life
 trainer/
   pipeline.py                the notebook's training steps as a function (validation, train, artifacts)
-  runs.py                    run registry, background training job
-  app.py                     Streamlit studio: train on a CSV, score other files
-Dockerfile, docker-compose.yml   container for the studio (volume with runs)
+  release.py                 production refit on train + validation, release check, model card
+  artifacts.py               writing models, tables, meta.json and model_card.json (notebook and pipeline)
+  runs.py                    run directories, training job (one at a time)
+  registry.py                production version: promote, roll back, history
+  scoring.py                 one scoring entry point for the studio, the CLI and the API
+  monitoring.py              training profile, PSI drift of a batch, scoring log
+  settings.py                configuration from environment variables, JSON logging
+  fslock.py                  file locks shared by the processes on one volume
+  app.py                     Streamlit studio
+  cli.py                     command line: train, promote, rollback, status, score, drift
+  api.py                     REST API (FastAPI): /healthz, /v1/model, /v1/score
+Dockerfile, docker-compose.yml   image and the two services (studio, api) on one volume
+.env.example                 names of the settings; copy to .env and set the secrets
 dashboard/
   data.py                    loading and checking the artifacts
   common.py                  logic shared by both dashboards, including CSV scoring
@@ -443,3 +625,8 @@ dashboard/
 | Remaining useful life (RUL) | How many more flight hours the drone will operate |
 | Landmark backtest | Check of the remaining-life forecast on drones that survived to a given flight time |
 | SHAP | Decomposition of a model forecast into feature contributions |
+| Evaluation model | Trained on the training set only; its test metrics are the quality figures |
+| Production model | Same settings refitted on training + validation; makes the forecasts |
+| Release check (gate) | Comparison of the production model with its evaluation model on the test set; a model that fails cannot be promoted |
+| Promotion / rollback | Making a trained version the one that scores new drones / returning to the previous one |
+| PSI | Population stability index: how far a feature's distribution in a scored batch is from training |
